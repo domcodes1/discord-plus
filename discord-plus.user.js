@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      2.0.0
+// @version      2.1.0
 // @description  Discord web extras: voice join/leave log for a server you pick (tracked in the background), and a full custom theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
@@ -11,6 +11,7 @@
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
+// @grant        unsafeWindow
 // @updateURL    https://raw.githubusercontent.com/domcodes1/discord-plus/main/discord-plus.user.js
 // @downloadURL  https://raw.githubusercontent.com/domcodes1/discord-plus/main/discord-plus.user.js
 // @run-at       document-idle
@@ -33,7 +34,13 @@
   };
   const get = (k) => GM_getValue(k, DEFAULTS[k]);
   const set = (k, v) => GM_setValue(k, v);
-  const watchGuildId = () => get('watchGuildId') || null;
+  const watchKey = () => get('watchGuildId') || null;
+  function watchMatches(guildId, guildName) {
+    const key = watchKey();
+    if (!key) return true;
+    if (key.indexOf('name:') === 0) return guildName === key.slice(5);
+    return guildId === key;
+  }
 
   /* ---------------- helpers ---------------- */
   function escapeHtml(s) {
@@ -56,45 +63,28 @@
     return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
   }
 
-  /* ---------------- guild list (for the server picker) ---------------- */
-  function listGuilds() {
-    const out = [];
-    document.querySelectorAll('a[href^="/channels/"]').forEach((a) => {
-      const m = (a.getAttribute('href') || '').match(/^\/channels\/(\d+)\//);
-      if (!m) return;
-      const id = m[1];
-      if (out.some((g) => g.id === id)) return;
-      let label = a.getAttribute('aria-label') || '';
-      label = label.replace(/,\s*\d+ unread.*$/i, '').replace(/,\s*muted$/i, '').trim();
-      out.push({ id, name: label || id });
-    });
-    return out;
-  }
-  function guildName(id) {
-    if (!id) return 'DM';
-    const g = listGuilds().find((x) => x.id === id);
-    return g ? g.name : 'Server';
-  }
-  function currentGuildIdFromUrl() {
-    const m = (location.pathname || '').match(/^\/channels\/(\d+)\//);
-    return m ? m[1] : null;
-  }
-
   /* ---------------- Discord internal stores (background voice data) ---------------- */
   let wpRequire = null;
   let stores = { voice: null, channel: null, user: null, guild: null };
   let lastStoreAttempt = 0;
 
+  function getPageWindow() {
+    try {
+      if (typeof unsafeWindow !== 'undefined' && unsafeWindow) return unsafeWindow;
+    } catch (e) { /* ignore */ }
+    return window;
+  }
   function getWpRequire() {
     if (wpRequire) return wpRequire;
-    const chunk = window.webpackChunkdiscord_app;
+    const pw = getPageWindow();
+    const chunk = (pw && pw.webpackChunkdiscord_app) || window.webpackChunkdiscord_app;
     if (!chunk || typeof chunk.push !== 'function') return null;
     try {
       chunk.push([['dp' + Math.random().toString(36).slice(2)], {}, (req) => { wpRequire = req; }]);
     } catch (e) { return null; }
     return wpRequire;
   }
-  function findStore(props) {
+  function findStore(props, anyOf) {
     const req = getWpRequire();
     if (!req || !req.c) return null;
     const cache = req.c;
@@ -103,25 +93,100 @@
       if (!mod || !mod.exports) continue;
       const candidates = [mod.exports, mod.exports.default, mod.exports.Z];
       for (const cand of candidates) {
-        if (cand && typeof cand === 'object' && props.every((p) => typeof cand[p] === 'function')) {
-          return cand;
+        if (!cand || typeof cand !== 'object') continue;
+        if (anyOf) {
+          if (props.some((p) => typeof cand[p] === 'function')) return cand;
+        } else {
+          if (props.every((p) => typeof cand[p] === 'function')) return cand;
         }
       }
     }
     return null;
   }
   function ensureStores() {
-    if (stores.voice && stores.channel && stores.user) return true;
+    if (stores.voice && stores.channel && stores.user && stores.guild) return true;
     const now = Date.now();
-    if (now - lastStoreAttempt < 10000) return false;
+    if (now - lastStoreAttempt < 5000) return false;
     lastStoreAttempt = now;
-    if (!stores.voice) stores.voice = findStore(['getVoiceStatesForChannel', 'getAllVoiceStates', 'getVoiceStateForUser']);
-    if (!stores.channel) stores.channel = findStore(['getChannel', 'getDMChannelFromUserId']);
-    if (!stores.user) stores.user = findStore(['getUser', 'getCurrentUser']);
-    if (!stores.guild) stores.guild = findStore(['getGuild', 'getGuilds']);
+    if (!stores.voice) stores.voice = findStore(['getVoiceStatesForChannel', 'getAllVoiceStates'], true);
+    if (!stores.channel) stores.channel = findStore(['getChannel', 'getDMChannelFromUserId'], true);
+    if (!stores.user) stores.user = findStore(['getUser', 'getCurrentUser'], true);
+    if (!stores.guild) stores.guild = findStore(['getGuild', 'getGuilds'], true);
     const ok = !!(stores.voice && stores.channel && stores.user);
     if (ok) log('background voice tracking on (Discord stores found)');
     return ok;
+  }
+  function resolveUserName(userId) {
+    try {
+      const u = stores.user && stores.user.getUser(userId);
+      if (u) return u.globalName || u.username || userId;
+    } catch (e) { /* ignore */ }
+    return userId;
+  }
+  function resolveGuildName(guildId) {
+    if (!guildId) return 'DM';
+    try {
+      const g = stores.guild && stores.guild.getGuild && stores.guild.getGuild(guildId);
+      if (g && g.name) return g.name;
+    } catch (e) { /* ignore */ }
+    return guildNameFromRail(guildId) || 'Server';
+  }
+
+  /* ---------------- guild list (for the server picker) ---------------- */
+  function listGuildsFromStores() {
+    if (!stores.guild || typeof stores.guild.getGuilds !== 'function') return [];
+    let all;
+    try { all = stores.guild.getGuilds(); } catch (e) { return []; }
+    if (!all) return [];
+    const entries = all instanceof Map ? Array.from(all.entries()) : Object.entries(all);
+    return entries.map(([id, g]) => ({ id: String(id), name: (g && g.name) || String(id) }));
+  }
+  function listGuildsFromRail() {
+    const out = [];
+    const rail = document.querySelector('nav[aria-label="Servers"]') || document.querySelector('[class*="guilds_"]');
+    const scope = rail || document;
+    scope.querySelectorAll('[aria-label]').forEach((el) => {
+      let label = (el.getAttribute('aria-label') || '').trim();
+      if (!label) return;
+      if (/^(direct messages|add a server|explore|download apps|create a server|discover)/i.test(label)) return;
+      label = label.replace(/,\s*\d+ unread.*$/i, '').replace(/,\s*muted$/i, '').trim();
+      if (!label || out.some((g) => g.name === label)) return;
+      out.push({ id: null, name: label });
+    });
+    return out;
+  }
+  function guildNameFromRail(guildId) {
+    return null; // rail items carry names, not ids; resolved by name instead
+  }
+  function listGuilds() {
+    const fromStores = listGuildsFromStores();
+    if (fromStores.length) return fromStores;
+    return listGuildsFromRail();
+  }
+  function guildName(id) {
+    if (!id) return 'DM';
+    const g = listGuilds().find((x) => x.id === id);
+    if (g) return g.name;
+    try {
+      const gg = stores.guild && stores.guild.getGuild && stores.guild.getGuild(id);
+      if (gg && gg.name) return gg.name;
+    } catch (e) { /* ignore */ }
+    return 'Server';
+  }
+  function currentGuildIdFromUrl() {
+    const m = (location.pathname || '').match(/^\/channels\/(\d+)\//);
+    return m ? m[1] : null;
+  }
+  function activeGuildName() {
+    const sidebar = document.querySelector('[class*="sidebar_"]');
+    if (sidebar) {
+      const header = sidebar.querySelector('[class*="header_"]');
+      if (header) {
+        const nameEl = header.querySelector('h1, [class*="name_"]');
+        if (nameEl && nameEl.textContent.trim()) return nameEl.textContent.trim();
+      }
+    }
+    return null;
   }
 
   /* ---------------- voice log ---------------- */
@@ -162,36 +227,54 @@
 
   function scanVoiceStores() {
     if (!ensureStores()) return false;
-    let all;
-    try { all = stores.voice.getAllVoiceStates(); } catch (e) { return false; }
-    if (!all) return false;
     const now = new Map();
-    const chanEntries = all instanceof Map ? Array.from(all.entries()) : Object.entries(all);
-    for (const [channelId, users] of chanEntries) {
-      const userIds = users instanceof Map ? Array.from(users.keys()) : Object.keys(users || {});
-      if (!userIds.length) continue;
-      let ch = null;
-      try { ch = stores.channel.getChannel(channelId); } catch (e) { /* ignore */ }
-      if (!ch) continue;
-      const guildId = ch.guild_id || null;
-      if (watchGuildId() && guildId !== watchGuildId()) continue;
-      let guildName = 'DM';
-      if (guildId) {
-        try {
-          const g = stores.guild ? stores.guild.getGuild(guildId) : null;
-          guildName = (g && g.name) || guildName(guildId);
-        } catch (e) { guildName = guildName(guildId); }
-      }
-      const channelName = ch.name || 'voice';
-      for (const userId of userIds) {
-        let user = userId;
-        try {
-          const u = stores.user.getUser(userId);
-          if (u) user = u.globalName || u.username || userId;
-        } catch (e) { /* ignore */ }
-        now.set((guildId || 'dm') + '|' + channelId + '|' + userId, { guild: guildName, guildId, channel: channelName, user });
+    let used = false;
+    // Primary: all voice states at once.
+    if (stores.voice && typeof stores.voice.getAllVoiceStates === 'function') {
+      let all;
+      try { all = stores.voice.getAllVoiceStates(); } catch (e) { all = null; }
+      if (all) {
+        const chanEntries = all instanceof Map ? Array.from(all.entries()) : Object.entries(all);
+        for (const [channelId, users] of chanEntries) {
+          const userIds = users instanceof Map ? Array.from(users.keys()) : Object.keys(users || {});
+          if (!userIds.length) continue;
+          let ch = null;
+          try { ch = stores.channel.getChannel(channelId); } catch (e) { /* ignore */ }
+          if (!ch) continue;
+          const guildId = ch.guild_id || null;
+          const guildName = resolveGuildName(guildId);
+          if (!watchMatches(guildId, guildName)) continue;
+          const channelName = ch.name || 'voice';
+          for (const userId of userIds) {
+            now.set((guildId || 'dm') + '|' + channelId + '|' + userId, { guild: guildName, guildId, channel: channelName, user: resolveUserName(userId) });
+          }
+        }
+        used = true;
       }
     }
+    // Secondary: enumerate channels and read each one's voice states.
+    if (!used && stores.voice && typeof stores.voice.getVoiceStatesForChannel === 'function' && stores.channel && typeof stores.channel.getAllChannels === 'function') {
+      let allChannels;
+      try { allChannels = stores.channel.getAllChannels(); } catch (e) { allChannels = null; }
+      if (allChannels) {
+        const chanList = allChannels instanceof Map ? Array.from(allChannels.values()) : Object.values(allChannels);
+        for (const ch of chanList) {
+          if (!ch || !ch.id) continue;
+          const guildId = ch.guild_id || null;
+          const guildName = resolveGuildName(guildId);
+          if (!watchMatches(guildId, guildName)) continue;
+          let states;
+          try { states = stores.voice.getVoiceStatesForChannel(ch.id); } catch (e) { continue; }
+          if (!states) continue;
+          const userIds = states instanceof Map ? Array.from(states.keys()) : Object.keys(states);
+          for (const userId of userIds) {
+            now.set((guildId || 'dm') + '|' + ch.id + '|' + userId, { guild: guildName, guildId, channel: ch.name || 'voice', user: resolveUserName(userId) });
+          }
+        }
+        used = true;
+      }
+    }
+    if (!used) return false;
     trackingMode = 'stores';
     diffVoice(now);
     return true;
@@ -218,7 +301,8 @@
 
   function scanVoiceDOM() {
     const currentGuild = currentGuildIdFromUrl();
-    if (watchGuildId() && currentGuild && currentGuild !== watchGuildId()) {
+    const currentName = activeGuildName() || guildName(currentGuild);
+    if (watchKey() && !watchMatches(currentGuild, currentName)) {
       // Watching a specific server but viewing a different one: nothing visible to log.
       voiceState = new Map();
       firstScan = false;
@@ -235,7 +319,7 @@
       if (!user) return;
       const channel = findChannelName(row) || 'voice';
       const gid = currentGuild || 'unknown';
-      now.set(gid + '|' + channel + '|' + user, { guild: guildName(gid), guildId: gid, channel, user });
+      now.set(gid + '|' + channel + '|' + user, { guild: currentName, guildId: gid, channel, user });
     });
     trackingMode = 'dom';
     diffVoice(now);
@@ -249,40 +333,44 @@
 
   /* ---------------- theme engine ---------------- */
   let themeStyleEl = null;
-  const GRADIENTS = {
-    neon: 'linear-gradient(135deg, #0b0b1a 0%, #1a0b2e 55%, #0b1a2e 100%)',
-    glass: 'linear-gradient(135deg, #0f2027 0%, #203a43 50%, #2c5364 100%)',
-    midnight: 'linear-gradient(180deg, #050507 0%, #0a0a12 100%)'
-  };
 
   function buildThemeCss() {
     const preset = get('themePreset');
     const accent = get('accent') || '#7c5cff';
     const accentDark = shade(accent, -25);
     const accentLight = shade(accent, 30);
+    const accentDeep = shade(accent, -70);
     const bgUrl = (get('bgUrl') || '').trim();
     const css = [];
     // declutter
     css.push('[aria-label="Send a gift"] { display: none !important; }');
     css.push('a[href="/shop"] { display: none !important; }');
     css.push('[aria-label="Shop"] { display: none !important; }');
-    // accent + dp accent variable for the panel button
+    // accent (also drives the background gradient below)
     css.push(':root { --brand-500: ' + accent + ' !important; --brand-600: ' + accentDark + ' !important; --brand-400: ' + accentLight + ' !important; --dp-accent: ' + accent + ' !important; }');
-    // app background
+    // background gradient: the accent is a stop, so changing the accent visibly changes the background
+    let gradient;
+    if (preset === 'glass') {
+      gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + shade(accent, -10) + ' 45%, #0e3a4a 100%)';
+    } else if (preset === 'midnight') {
+      gradient = 'linear-gradient(180deg, #050507 0%, ' + accentDeep + ' 100%)';
+    } else {
+      gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + accent + ' 50%, #0a1a3a 100%)';
+    }
     if (bgUrl) {
       css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
     } else {
-      css.push('[class*="appMount_"] { background: ' + (GRADIENTS[preset] || GRADIENTS.neon) + ' !important; }');
+      css.push('[class*="appMount_"] { background: ' + gradient + ' !important; }');
     }
     if (preset === 'glass' && !bgUrl) {
       css.push('[class*="appMount_"] { background-size: 300% 300% !important; animation: dpGrad 25s ease infinite !important; }');
       css.push('@keyframes dpGrad { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }');
     }
-    // glass columns so the background shows through, dark enough to read
-    css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: rgba(8, 8, 18, 0.55) !important; backdrop-filter: blur(10px); }');
-    // server icons: rounded with a glow on hover
-    css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 14px !important; transition: transform .15s ease, box-shadow .15s ease !important; }');
-    css.push('[class*="listItem_"]:hover [class*="icon_"], [class*="listItem_"]:hover img { transform: scale(1.07); box-shadow: 0 0 14px ' + accent + ' !important; }');
+    // translucent panels so the gradient shows through, dark enough to read
+    css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: rgba(8, 8, 18, 0.35) !important; backdrop-filter: blur(10px); }');
+    // server icons: glow at rest, stronger on hover
+    css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 14px !important; box-shadow: 0 0 8px ' + accent + '66 !important; transition: transform .15s ease, box-shadow .15s ease !important; }');
+    css.push('[class*="listItem_"]:hover [class*="icon_"], [class*="listItem_"]:hover img { transform: scale(1.07); box-shadow: 0 0 16px ' + accent + ' !important; }');
     // message hover
     css.push('[id^="chat-messages-"]:hover { background: rgba(255,255,255,0.04) !important; border-radius: 8px; }');
     // accent scrollbar
@@ -321,7 +409,8 @@
     }
     const status = document.getElementById('dp-voice-status');
     if (status) {
-      const watched = watchGuildId() ? guildName(watchGuildId()) : null;
+      const key = watchKey();
+      const watched = key ? (key.indexOf('name:') === 0 ? key.slice(5) : guildName(key)) : null;
       if (trackingMode === 'stores') {
         status.textContent = watched ? 'Watching ' + watched + ' in the background.' : 'Tracking every server in the background.';
       } else {
@@ -334,9 +423,22 @@
     const sel = document.getElementById('dp-watch-guild');
     if (!sel) return;
     const guilds = listGuilds();
-    const current = watchGuildId();
-    sel.innerHTML = '<option value="">All servers</option>' + guilds.map((g) => '<option value="' + escapeHtml(g.id) + '">' + escapeHtml(g.name) + '</option>').join('');
+    const current = watchKey();
+    let html = '<option value="">All servers</option>';
+    guilds.forEach((g) => {
+      const value = g.id ? g.id : 'name:' + g.name;
+      html += '<option value="' + escapeHtml(value) + '">' + escapeHtml(g.name) + '</option>';
+    });
+    sel.innerHTML = html;
     sel.value = current || '';
+    // If the saved watch key is a name that is no longer listed, keep it visible.
+    if (current && sel.value !== current) {
+      const opt = document.createElement('option');
+      opt.value = current;
+      opt.textContent = current.indexOf('name:') === 0 ? current.slice(5) : current;
+      sel.appendChild(opt);
+      sel.value = current;
+    }
   }
 
   function togglePanel() {
@@ -372,7 +474,7 @@
       '<div class="dp-panel-head"><strong>Discord Plus</strong><button id="dp-panel-close" title="Close">✕</button></div>' +
       '<div class="dp-section"><div class="dp-section-title">Watch server</div>' +
       '<select id="dp-watch-guild"></select>' +
-      '<div class="dp-note">Voice activity is logged for this server, even while you are looking at another server or your DMs.</div></div>' +
+      '<div class="dp-note">Pick a server to track its voice activity. Background tracking needs Discord\u2019s internal data; if that is unavailable the log only covers the server you are viewing.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Voice log <button id="dp-log-clear">Clear</button></div>' +
       '<div id="dp-log-list" class="dp-log-list"></div>' +
       '<div id="dp-voice-status" class="dp-note"></div></div>' +
@@ -384,7 +486,7 @@
       '</div>' +
       '<label>Accent <input type="color" id="dp-accent"></label>' +
       '<label>Background image URL <input type="text" id="dp-bgurl" placeholder="https://..."></label>' +
-      '<div class="dp-note">Paste any image URL for a custom background. Leave it empty for the preset gradient.</div></div>' +
+      '<div class="dp-note">The accent color tints the background gradient, so changing it changes the whole look. Paste any image URL for a custom background, or leave it empty for the preset gradient.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Settings</div>' +
       '<label><input type="checkbox" id="dp-set-voice"> Voice join/leave log</label>' +
       '<label><input type="checkbox" id="dp-set-theme"> Custom look</label>' +
@@ -469,7 +571,7 @@
       GM_registerMenuCommand('Discord Plus: open panel', togglePanel);
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v2.0.0');
+      log('loaded v2.1.0');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }

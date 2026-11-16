@@ -3,7 +3,7 @@
 A Tampermonkey userscript for Discord web with two features in one script:
 
 1. **Voice join/leave log for a server you pick** — open the purple "DP" button bottom-right, choose a server under "Watch server", and the log records who joined or left voice, and when. It reads Discord's own voice data, so it keeps tracking that server even while you are looking at another server or your DMs. If Discord's internal data is not available, it falls back to logging the server you are viewing. The panel shows which mode it is in.
-2. **Custom look (theme engine)** — three presets (Neon, Glass, Midnight), an accent color picker, and a custom background image URL. It also hides the Nitro gift button and the Shop tab, rounds the server icons with a glow on hover, and restyles the scrollbar.
+2. **Custom look (theme engine)** — three presets (Neon, Glass, Midnight), an accent color picker, and a custom background image URL. The accent color tints the whole background gradient, so changing it changes the look. It also hides the Nitro gift button and the Shop tab, rounds the server icons with a glow, and restyles the scrollbar.
 
 ## Install
 
