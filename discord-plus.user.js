@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      3.0.0
+// @version      3.0.1
 // @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
@@ -484,10 +484,61 @@
     try {
       if (typeof stores.message.getMessages === 'function') {
         const msgs = stores.message.getMessages(channelId);
-        const list = msgs && typeof msgs.toArray === 'function' ? msgs.toArray() : (msgs instanceof Map ? Array.from(msgs.values()) : Object.values(msgs || {}));
+        const list = msgs && typeof msgs.toArray === 'function' ? msgs.toArray() : (msgs instanceof Map ? Array.from(msgs.values()) : (msgs && typeof msgs.getArray === 'function' ? msgs.getArray() : Object.values(msgs || {})));
         list.forEach(cacheMessage);
       }
     } catch (e) { /* ignore */ }
+  }
+  // Backup cache: read messages straight from the DOM, so a fast delete
+  // (sent and deleted in under 3 seconds) is still caught even if the
+  // store poll has not run yet.
+  function scanMessagesDOM() {
+    if (!get('deletedLog')) return;
+    const channelId = currentChannelIdFromUrl();
+    if (!channelId) return;
+    try {
+      document.querySelectorAll('[class*="messageContent_"]').forEach((contentEl) => {
+        let node = contentEl;
+        let msgId = null;
+        for (let i = 0; i < 6 && node; i++) {
+          const idAttr = node.getAttribute && (node.getAttribute('id') || node.getAttribute('data-list-item-id') || '');
+          const m = String(idAttr).match(/(\d{17,20})/g);
+          if (m && m.length) { msgId = m[m.length - 1]; break; }
+          node = node.parentElement;
+        }
+        if (!msgId || msgCache.has(msgId)) return;
+        let author = 'Unknown';
+        const root = contentEl.closest('[class*="message_"]') || contentEl.parentElement;
+        if (root) {
+          const header = root.querySelector('[class*="username_"], [class*="headerText_"]');
+          if (header && header.textContent.trim()) author = header.textContent.trim();
+        }
+        const content = contentEl.textContent || '';
+        if (!content.trim()) return;
+        msgCache.set(msgId, { id: msgId, channelId, author, content, t: Date.now(), attachment: false });
+      });
+    } catch (e) { /* ignore */ }
+  }
+  function dpDiagnostics() {
+    return {
+      voiceStore: !!stores.voice,
+      channelStore: !!stores.channel,
+      userStore: !!stores.user,
+      messageStore: !!stores.message,
+      dispatcher: !!stores.dispatcher,
+      dispatcherSubscribed,
+      streamStore: !!stores.stream,
+      cachedMessages: msgCache.size,
+      deletedCaught: loadDeleted().length,
+      liveChannels: liveCache.length,
+      trackingMode
+    };
+  }
+  function renderDiagnostics() {
+    const el = document.getElementById('dp-diag');
+    if (!el) return;
+    const d = dpDiagnostics();
+    el.textContent = 'Diag: voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
   }
   function onMessageDelete(channelId, messageId) {
     if (!get('deletedLog')) return;
@@ -532,7 +583,7 @@
       div.setAttribute('data-dp-deleted', String(entry.msgT));
       div.innerHTML = '<span class="dp-deleted-badge">Deleted</span> <strong>' + escapeHtml(entry.author) + '</strong> <span class="dp-deleted-time">' + fmtTime(entry.msgT) + '</span><div class="dp-deleted-text">' + escapeHtml(entry.content || (entry.attachment ? '[attachment]' : '[no text]')) + '</div>';
       scroller.appendChild(div);
-      div.scrollIntoView({ block: 'nearest' });
+      // Do not scroll the user: a deleted message should not yank their view.
     } catch (e) { /* ignore */ }
   }
 
@@ -691,7 +742,7 @@
     if (tab === 'live') { refreshWatchSelect(); renderLive(); }
     if (tab === 'log') renderVoiceLog();
     if (tab === 'deleted') renderDeleted();
-    if (tab === 'look') markActivePreset();
+    if (tab === 'look') { markActivePreset(); renderDiagnostics(); }
   }
 
   function togglePanel() {
@@ -720,7 +771,7 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.1</span><button id="dp-panel-close" title="Close">X</button></div>' +
       '<div class="dp-tabs">' +
       '<button data-tab="live">Live</button>' +
       '<button data-tab="log">Voice log</button>' +
@@ -756,6 +807,9 @@
       '<label>Accent <input type="color" id="dp-accent"></label>' +
       '<label>Background image URL <input type="text" id="dp-bgurl" placeholder="https://..."></label>' +
       '<div class="dp-note">Clean is the new default: solid dark, no glow. The accent only tints small highlights.</div></div>' +
+      '<div class="dp-section"><div class="dp-section-title">Diagnostics</div>' +
+      '<div id="dp-diag" class="dp-note">Diag: loading...</div>' +
+      '<div class="dp-note">If a feature shows no, that store was not found, and that feature is the one to fix.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Settings</div>' +
       '<label><input type="checkbox" id="dp-set-voice"> Voice join/leave log</label>' +
       '<label><input type="checkbox" id="dp-set-deleted"> Deleted messages</label>' +
@@ -883,12 +937,15 @@
       setInterval(scanVoice, 2000);
       setInterval(scanLive, 2000);
       setInterval(pollMessageStore, 3000);
+      setInterval(scanMessagesDOM, 2000);
       setInterval(subscribeDispatcher, 10000);
+      setInterval(renderDiagnostics, 3000);
+      renderDiagnostics();
       GM_registerMenuCommand('Discord Plus: open panel', togglePanel);
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v3.0.0');
+      log('loaded v3.0.1');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }
