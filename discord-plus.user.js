@@ -1,8 +1,8 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      2.1.0
-// @description  Discord web extras: voice join/leave log for a server you pick (tracked in the background), and a full custom theme engine.
+// @version      3.0.0
+// @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
 // @match        https://*.discord.com/*
@@ -26,9 +26,11 @@
   /* ---------------- settings ---------------- */
   const DEFAULTS = {
     voiceLog: true,
+    deletedLog: true,
+    liveNow: true,
     themeOn: true,
-    themePreset: 'neon',
-    accent: '#7c5cff',
+    themePreset: 'clean',
+    accent: '#5865f2',
     bgUrl: '',
     watchGuildId: null
   };
@@ -51,7 +53,7 @@
     return d.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
   }
   function shade(hex, percent) {
-    let h = String(hex || '#7c5cff').replace('#', '');
+    let h = String(hex || '#5865f2').replace('#', '');
     if (h.length === 3) h = h.split('').map((c) => c + c).join('');
     const num = parseInt(h, 16) || 0;
     let r = (num >> 16) & 255, g = (num >> 8) & 255, b = num & 255;
@@ -62,10 +64,18 @@
     b = Math.round((t - b) * p + b);
     return '#' + ((1 << 24) + (r << 16) + (g << 8) + b).toString(16).slice(1);
   }
+  function currentChannelIdFromUrl() {
+    const m = (location.pathname || '').match(/^\/channels\/\d+\/(\d+)/);
+    return m ? m[1] : null;
+  }
+  function currentGuildIdFromUrl() {
+    const m = (location.pathname || '').match(/^\/channels\/(\d+)\//);
+    return m ? m[1] : null;
+  }
 
-  /* ---------------- Discord internal stores (background voice data) ---------------- */
+  /* ---------------- Discord internal stores ---------------- */
   let wpRequire = null;
-  let stores = { voice: null, channel: null, user: null, guild: null };
+  let stores = { voice: null, channel: null, user: null, guild: null, message: null, dispatcher: null, stream: null, speaking: null };
   let lastStoreAttempt = 0;
 
   function getPageWindow() {
@@ -104,16 +114,19 @@
     return null;
   }
   function ensureStores() {
-    if (stores.voice && stores.channel && stores.user && stores.guild) return true;
     const now = Date.now();
-    if (now - lastStoreAttempt < 5000) return false;
+    if (now - lastStoreAttempt < 5000) return !!(stores.voice && stores.channel && stores.user);
     lastStoreAttempt = now;
     if (!stores.voice) stores.voice = findStore(['getVoiceStatesForChannel', 'getAllVoiceStates'], true);
     if (!stores.channel) stores.channel = findStore(['getChannel', 'getDMChannelFromUserId'], true);
     if (!stores.user) stores.user = findStore(['getUser', 'getCurrentUser'], true);
     if (!stores.guild) stores.guild = findStore(['getGuild', 'getGuilds'], true);
+    if (!stores.message) stores.message = findStore(['getMessage', 'getMessages'], true);
+    if (!stores.dispatcher) stores.dispatcher = findStore(['subscribe', 'dispatch'], false);
+    if (!stores.stream) stores.stream = findStore(['getAllApplicationStreams', 'getStreamForUser'], true);
+    if (!stores.speaking) stores.speaking = findStore(['isSpeaking'], true);
     const ok = !!(stores.voice && stores.channel && stores.user);
-    if (ok) log('background voice tracking on (Discord stores found)');
+    if (ok) log('stores found, voice tracking on');
     return ok;
   }
   function resolveUserName(userId) {
@@ -129,7 +142,7 @@
       const g = stores.guild && stores.guild.getGuild && stores.guild.getGuild(guildId);
       if (g && g.name) return g.name;
     } catch (e) { /* ignore */ }
-    return guildNameFromRail(guildId) || 'Server';
+    return 'Server';
   }
 
   /* ---------------- guild list (for the server picker) ---------------- */
@@ -155,9 +168,6 @@
     });
     return out;
   }
-  function guildNameFromRail(guildId) {
-    return null; // rail items carry names, not ids; resolved by name instead
-  }
   function listGuilds() {
     const fromStores = listGuildsFromStores();
     if (fromStores.length) return fromStores;
@@ -172,10 +182,6 @@
       if (gg && gg.name) return gg.name;
     } catch (e) { /* ignore */ }
     return 'Server';
-  }
-  function currentGuildIdFromUrl() {
-    const m = (location.pathname || '').match(/^\/channels\/(\d+)\//);
-    return m ? m[1] : null;
   }
   function activeGuildName() {
     const sidebar = document.querySelector('[class*="sidebar_"]');
@@ -194,7 +200,7 @@
   const MAX_LOG = 300;
   let voiceState = new Map();
   let firstScan = true;
-  let trackingMode = 'dom'; // 'stores' or 'dom'
+  let trackingMode = 'dom';
 
   function loadLog() {
     try { return JSON.parse(GM_getValue(LOG_KEY, '[]')); } catch (e) { return []; }
@@ -215,8 +221,6 @@
       return;
     }
     if (now.size === 0 && voiceState.size > 0) {
-      // Everything vanished at once: the user switched servers/views.
-      // Reset the baseline silently instead of logging a mass exodus.
       voiceState = now;
       return;
     }
@@ -229,7 +233,6 @@
     if (!ensureStores()) return false;
     const now = new Map();
     let used = false;
-    // Primary: all voice states at once.
     if (stores.voice && typeof stores.voice.getAllVoiceStates === 'function') {
       let all;
       try { all = stores.voice.getAllVoiceStates(); } catch (e) { all = null; }
@@ -252,7 +255,6 @@
         used = true;
       }
     }
-    // Secondary: enumerate channels and read each one's voice states.
     if (!used && stores.voice && typeof stores.voice.getVoiceStatesForChannel === 'function' && stores.channel && typeof stores.channel.getAllChannels === 'function') {
       let allChannels;
       try { allChannels = stores.channel.getAllChannels(); } catch (e) { allChannels = null; }
@@ -303,7 +305,6 @@
     const currentGuild = currentGuildIdFromUrl();
     const currentName = activeGuildName() || guildName(currentGuild);
     if (watchKey() && !watchMatches(currentGuild, currentName)) {
-      // Watching a specific server but viewing a different one: nothing visible to log.
       voiceState = new Map();
       firstScan = false;
       trackingMode = 'dom';
@@ -331,53 +332,253 @@
     scanVoiceDOM();
   }
 
-  /* ---------------- theme engine ---------------- */
+  /* ---------------- Live Now: who is in voice / speaking / streaming, without joining ---------------- */
+  let liveCache = [];
+  let liveUpdatedAt = 0;
+
+  function speakingFromDOM() {
+    const out = new Map();
+    document.querySelectorAll('[class*="voiceUser"]').forEach((row) => {
+      const nameEl = row.querySelector('[class*="username"]');
+      const name = nameEl ? nameEl.textContent.trim() : '';
+      if (!name) return;
+      const speaking = !!row.querySelector('[class*="avatarSpeaking"], [class*="speaking"]');
+      out.set(name, speaking);
+    });
+    return out;
+  }
+  function streamOwners() {
+    const out = new Set();
+    try {
+      if (stores.stream && typeof stores.stream.getAllApplicationStreams === 'function') {
+        const all = stores.stream.getAllApplicationStreams();
+        const list = all instanceof Map ? Array.from(all.values()) : Object.values(all || {});
+        list.forEach((s) => { if (s && s.ownerId) out.add(String(s.ownerId)); });
+      }
+    } catch (e) { /* ignore */ }
+    return out;
+  }
+  function scanLive() {
+    if (!get('liveNow')) { liveCache = []; return; }
+    if (!ensureStores()) return;
+    const speakingDom = speakingFromDOM();
+    const streams = streamOwners();
+    const byChannel = new Map();
+    const addUser = (guild, guildId, channelId, channelName, userId, state) => {
+      if (!watchMatches(guildId, guild)) return;
+      const key = channelId;
+      if (!byChannel.has(key)) byChannel.set(key, { channel: channelName, guild, users: [] });
+      const name = resolveUserName(userId);
+      let speaking = false;
+      try {
+        if (stores.speaking && typeof stores.speaking.isSpeaking === 'function') speaking = !!stores.speaking.isSpeaking(userId);
+      } catch (e) { /* ignore */ }
+      if (!speaking) speaking = speakingDom.get(name) || false;
+      const streaming = !!(state && (state.selfStream || state.streaming)) || streams.has(String(userId));
+      const muted = !!(state && (state.selfMute || state.mute));
+      byChannel.get(key).users.push({ user: name, userId: String(userId), speaking, streaming, muted });
+    };
+    let used = false;
+    if (stores.voice && typeof stores.voice.getAllVoiceStates === 'function') {
+      try {
+        const all = stores.voice.getAllVoiceStates();
+        if (all) {
+          const entries = all instanceof Map ? Array.from(all.entries()) : Object.entries(all);
+          for (const [channelId, users] of entries) {
+            const map = users instanceof Map ? users : new Map(Object.entries(users || {}));
+            if (!map.size) continue;
+            let ch = null;
+            try { ch = stores.channel.getChannel(channelId); } catch (e) { /* ignore */ }
+            if (!ch) continue;
+            const guildId = ch.guild_id || null;
+            const guild = resolveGuildName(guildId);
+            map.forEach((state, userId) => addUser(guild, guildId, channelId, ch.name || 'voice', userId, state));
+          }
+          used = true;
+        }
+      } catch (e) { /* ignore */ }
+    }
+    if (!used) {
+      const sidebar = document.querySelector('[class*="sidebar"]');
+      const scope = sidebar || document;
+      scope.querySelectorAll('[class*="voiceUser"]').forEach((row) => {
+        const nameEl = row.querySelector('[class*="username"]');
+        const user = nameEl ? nameEl.textContent.trim() : '';
+        if (!user) return;
+        const channel = findChannelName(row) || 'voice';
+        const gid = currentGuildIdFromUrl();
+        const guild = activeGuildName() || guildName(gid);
+        if (!watchMatches(gid, guild)) return;
+        const key = channel;
+        if (!byChannel.has(key)) byChannel.set(key, { channel, guild, users: [] });
+        byChannel.get(key).users.push({ user, userId: '', speaking: speakingDom.get(user) || false, streaming: false, muted: false });
+      });
+    }
+    liveCache = Array.from(byChannel.values()).sort((a, b) => a.channel.localeCompare(b.channel));
+    liveUpdatedAt = Date.now();
+    renderLive();
+  }
+  function watchStreamForUser(userName) {
+    // Best effort: open that person's voice row popout, then click Watch Stream.
+    const rows = Array.from(document.querySelectorAll('[class*="voiceUser"]'));
+    const row = rows.find((r) => {
+      const n = r.querySelector('[class*="username"]');
+      return n && n.textContent.trim() === userName;
+    });
+    if (!row) return false;
+    row.dispatchEvent(new MouseEvent('click', { bubbles: true }));
+    setTimeout(() => {
+      const btns = Array.from(document.querySelectorAll('button, [role="button"]'));
+      const watch = btns.find((b) => /watch stream/i.test(b.textContent || '') || /watch stream/i.test(b.getAttribute('aria-label') || ''));
+      if (watch) watch.click();
+    }, 350);
+    return true;
+  }
+
+  /* ---------------- Deleted messages ---------------- */
+  // Only messages Discord already showed you while this tab was open can be
+  // recovered. If a message was deleted before you opened the channel, or
+  // while Discord was closed, there is nothing cached to show.
+  const DELETED_KEY = 'dp_deleted_log_v1';
+  const MAX_DELETED = 100;
+  const msgCache = new Map();
+  let dispatcherSubscribed = false;
+
+  function loadDeleted() {
+    try { return JSON.parse(GM_getValue(DELETED_KEY, '[]')); } catch (e) { return []; }
+  }
+  function saveDeleted(entries) {
+    GM_setValue(DELETED_KEY, JSON.stringify(entries.slice(-MAX_DELETED)));
+  }
+  function cacheMessage(m) {
+    if (!m || !m.id) return;
+    const id = String(m.id);
+    if (msgCache.has(id)) return;
+    let author = '';
+    try {
+      if (m.author) author = m.author.globalName || m.author.username || String(m.author.id || '');
+      else if (m.authorId) author = resolveUserName(String(m.authorId));
+    } catch (e) { /* ignore */ }
+    const content = typeof m.content === 'string' ? m.content : '';
+    const hasAttachment = !!(m.attachments && (m.attachments.length || m.attachments.size));
+    const hasEmbed = !!(m.embeds && (m.embeds.length || m.embeds.size));
+    if (!content && !hasAttachment && !hasEmbed) return;
+    msgCache.set(id, {
+      id,
+      channelId: String(m.channel_id || m.channelId || currentChannelIdFromUrl() || ''),
+      author: author || 'Unknown',
+      content,
+      t: m.timestamp ? new Date(m.timestamp).getTime() : Date.now(),
+      attachment: hasAttachment
+    });
+    if (msgCache.size > 2000) {
+      const first = msgCache.keys().next().value;
+      msgCache.delete(first);
+    }
+  }
+  function pollMessageStore() {
+    if (!get('deletedLog')) return;
+    if (!ensureStores() || !stores.message) return;
+    const channelId = currentChannelIdFromUrl();
+    if (!channelId) return;
+    try {
+      if (typeof stores.message.getMessages === 'function') {
+        const msgs = stores.message.getMessages(channelId);
+        const list = msgs && typeof msgs.toArray === 'function' ? msgs.toArray() : (msgs instanceof Map ? Array.from(msgs.values()) : Object.values(msgs || {}));
+        list.forEach(cacheMessage);
+      }
+    } catch (e) { /* ignore */ }
+  }
+  function onMessageDelete(channelId, messageId) {
+    if (!get('deletedLog')) return;
+    const cached = msgCache.get(String(messageId));
+    if (!cached) return;
+    let channelName = '';
+    try {
+      const ch = stores.channel && stores.channel.getChannel(channelId);
+      if (ch && ch.name) channelName = ch.name;
+    } catch (e) { /* ignore */ }
+    const entry = { t: Date.now(), msgT: cached.t, channel: channelName, channelId: String(channelId), author: cached.author, content: cached.content, attachment: cached.attachment };
+    const entries = loadDeleted();
+    if (entries.some((x) => x.msgT === entry.msgT && x.author === entry.author && x.content === entry.content)) return;
+    entries.push(entry);
+    saveDeleted(entries);
+    renderDeleted();
+    insertDeletedGhost(entry);
+  }
+  function subscribeDispatcher() {
+    if (dispatcherSubscribed) return;
+    if (!ensureStores() || !stores.dispatcher || typeof stores.dispatcher.subscribe !== 'function') return;
+    try {
+      stores.dispatcher.subscribe('MESSAGE_DELETE', (e) => {
+        if (e && e.id) onMessageDelete(e.channelId, e.id);
+      });
+      stores.dispatcher.subscribe('MESSAGE_DELETE_BULK', (e) => {
+        if (e && Array.isArray(e.ids)) e.ids.forEach((id) => onMessageDelete(e.channelId, id));
+      });
+      dispatcherSubscribed = true;
+      log('deleted-message tracking on');
+    } catch (e) { /* ignore */ }
+  }
+  function insertDeletedGhost(entry) {
+    try {
+      const channelId = currentChannelIdFromUrl();
+      if (!channelId || String(channelId) !== String(entry.channelId)) return;
+      const scroller = document.querySelector('[class*="messagesWrapper_"] [class*="scroller_"], [class*="scrollerContent_"]');
+      if (!scroller) return;
+      if (scroller.querySelector('[data-dp-deleted="' + entry.msgT + '"]')) return;
+      const div = document.createElement('div');
+      div.className = 'dp-deleted-ghost';
+      div.setAttribute('data-dp-deleted', String(entry.msgT));
+      div.innerHTML = '<span class="dp-deleted-badge">Deleted</span> <strong>' + escapeHtml(entry.author) + '</strong> <span class="dp-deleted-time">' + fmtTime(entry.msgT) + '</span><div class="dp-deleted-text">' + escapeHtml(entry.content || (entry.attachment ? '[attachment]' : '[no text]')) + '</div>';
+      scroller.appendChild(div);
+      div.scrollIntoView({ block: 'nearest' });
+    } catch (e) { /* ignore */ }
+  }
+
+  /* ---------------- theme engine (cleaner, subtler by default) ---------------- */
   let themeStyleEl = null;
 
   function buildThemeCss() {
     const preset = get('themePreset');
-    const accent = get('accent') || '#7c5cff';
+    const accent = get('accent') || '#5865f2';
     const accentDark = shade(accent, -25);
     const accentLight = shade(accent, 30);
     const accentDeep = shade(accent, -70);
     const bgUrl = (get('bgUrl') || '').trim();
     const css = [];
-    // declutter
     css.push('[aria-label="Send a gift"] { display: none !important; }');
     css.push('a[href="/shop"] { display: none !important; }');
     css.push('[aria-label="Shop"] { display: none !important; }');
-    // accent (also drives the background gradient below)
     css.push(':root { --brand-500: ' + accent + ' !important; --brand-600: ' + accentDark + ' !important; --brand-400: ' + accentLight + ' !important; --dp-accent: ' + accent + ' !important; }');
-    // background gradient: the accent is a stop, so changing the accent visibly changes the background
-    let gradient;
-    if (preset === 'glass') {
-      gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + shade(accent, -10) + ' 45%, #0e3a4a 100%)';
-    } else if (preset === 'midnight') {
-      gradient = 'linear-gradient(180deg, #050507 0%, ' + accentDeep + ' 100%)';
+    if (preset === 'clean') {
+      // Clean: solid dark, no loud gradient, no glow. Accent only for small highlights.
+      css.push('[class*="appMount_"] { background: #111214 !important; }');
+      if (bgUrl) {
+        css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
+      }
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: transparent !important; }');
+      css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 10px !important; }');
     } else {
-      gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + accent + ' 50%, #0a1a3a 100%)';
+      let gradient;
+      if (preset === 'glass') {
+        gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + shade(accent, -10) + ' 45%, #0e3a4a 100%)';
+      } else if (preset === 'midnight') {
+        gradient = 'linear-gradient(180deg, #050507 0%, ' + accentDeep + ' 100%)';
+      } else {
+        gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + accent + ' 50%, #0a1a3a 100%)';
+      }
+      if (bgUrl) {
+        css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
+      } else {
+        css.push('[class*="appMount_"] { background: ' + gradient + ' !important; }');
+      }
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: rgba(8, 8, 18, 0.35) !important; backdrop-filter: blur(10px); }');
+      css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 12px !important; box-shadow: 0 0 6px ' + accent + '44 !important; }');
     }
-    if (bgUrl) {
-      css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
-    } else {
-      css.push('[class*="appMount_"] { background: ' + gradient + ' !important; }');
-    }
-    if (preset === 'glass' && !bgUrl) {
-      css.push('[class*="appMount_"] { background-size: 300% 300% !important; animation: dpGrad 25s ease infinite !important; }');
-      css.push('@keyframes dpGrad { 0% { background-position: 0% 50%; } 50% { background-position: 100% 50%; } 100% { background-position: 0% 50%; } }');
-    }
-    // translucent panels so the gradient shows through, dark enough to read
-    css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: rgba(8, 8, 18, 0.35) !important; backdrop-filter: blur(10px); }');
-    // server icons: glow at rest, stronger on hover
-    css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 14px !important; box-shadow: 0 0 8px ' + accent + '66 !important; transition: transform .15s ease, box-shadow .15s ease !important; }');
-    css.push('[class*="listItem_"]:hover [class*="icon_"], [class*="listItem_"]:hover img { transform: scale(1.07); box-shadow: 0 0 16px ' + accent + ' !important; }');
-    // message hover
-    css.push('[id^="chat-messages-"]:hover { background: rgba(255,255,255,0.04) !important; border-radius: 8px; }');
-    // accent scrollbar
     css.push('::-webkit-scrollbar { width: 10px !important; height: 10px !important; }');
     css.push('::-webkit-scrollbar-thumb { background: ' + accent + ' !important; border-radius: 8px !important; border: 2px solid transparent !important; background-clip: content-box !important; }');
     css.push('::-webkit-scrollbar-track { background: transparent !important; }');
-    // midnight preset: flatter, darker panels
     if (preset === 'midnight') {
       css.push(':root { --background-primary: #0a0a10 !important; --background-secondary: #101018 !important; --background-tertiary: #15151f !important; }');
     }
@@ -389,9 +590,10 @@
     if (get('themeOn')) themeStyleEl = GM_addStyle(buildThemeCss());
   }
 
-  /* ---------------- UI: floating panel ---------------- */
+  /* ---------------- UI: cleaner tabbed panel ---------------- */
   let panel = null;
   let panelOpen = false;
+  let activeTab = 'live';
 
   function renderVoiceLog() {
     const list = document.getElementById('dp-log-list');
@@ -414,8 +616,46 @@
       if (trackingMode === 'stores') {
         status.textContent = watched ? 'Watching ' + watched + ' in the background.' : 'Tracking every server in the background.';
       } else {
-        status.textContent = watched ? 'Watching ' + watched + ' — switch to that server to log it.' : 'Only logs the server you are viewing right now.';
+        status.textContent = watched ? 'Watching ' + watched + ' - switch to that server to log it.' : 'Only logs the server you are viewing right now.';
       }
+    }
+  }
+
+  function renderLive() {
+    const list = document.getElementById('dp-live-list');
+    if (!list) return;
+    if (!liveCache.length) {
+      list.innerHTML = '<div class="dp-empty">Nobody in voice right now' + (watchKey() ? ' in the watched server' : '') + '. Pick a server above to watch a specific one.</div>';
+      return;
+    }
+    list.innerHTML = liveCache.map((ch) => {
+      const users = ch.users.map((u) => {
+        const badges = [];
+        if (u.streaming) badges.push('<span class="dp-badge-live">LIVE</span>');
+        if (u.speaking) badges.push('<span class="dp-badge-speaking">speaking</span>');
+        if (u.muted) badges.push('<span class="dp-badge-muted">muted</span>');
+        const watchBtn = u.streaming ? ' <button class="dp-watch-btn" data-user="' + escapeHtml(u.user) + '">Watch</button>' : '';
+        return '<div class="dp-live-user' + (u.speaking ? ' dp-speaking' : '') + '"><span class="dp-dot' + (u.speaking ? ' dp-dot-speaking' : '') + '"></span> <strong>' + escapeHtml(u.user) + '</strong> ' + badges.join(' ') + watchBtn + '</div>';
+      }).join('');
+      return '<div class="dp-live-channel"><div class="dp-live-channel-name">#' + escapeHtml(ch.channel) + ' <span class="dp-guild">' + escapeHtml(ch.guild || '') + '</span></div>' + users + '</div>';
+    }).join('');
+    list.querySelectorAll('.dp-watch-btn').forEach((b) => {
+      b.addEventListener('click', () => watchStreamForUser(b.getAttribute('data-user')));
+    });
+    const meta = document.getElementById('dp-live-meta');
+    if (meta && liveUpdatedAt) meta.textContent = 'Updated ' + fmtTime(liveUpdatedAt) + ' - no need to join to see this.';
+  }
+
+  function renderDeleted() {
+    const list = document.getElementById('dp-deleted-list');
+    if (!list) return;
+    const entries = loadDeleted().slice().reverse();
+    if (!entries.length) {
+      list.innerHTML = '<div class="dp-empty">No deleted messages caught yet. Keep Discord open and this only catches messages you already saw.</div>';
+    } else {
+      list.innerHTML = entries.map((e) => {
+        return '<div class="dp-deleted-row"><div class="dp-deleted-head"><strong>' + escapeHtml(e.author) + '</strong> <span class="dp-time">' + fmtTime(e.msgT || e.t) + '</span>' + (e.channel ? ' <span class="dp-guild">#' + escapeHtml(e.channel) + '</span>' : '') + ' <span class="dp-deleted-badge">Deleted</span></div><div class="dp-deleted-text">' + escapeHtml(e.content || (e.attachment ? '[attachment]' : '[no text]')) + '</div></div>';
+      }).join('');
     }
   }
 
@@ -431,7 +671,6 @@
     });
     sel.innerHTML = html;
     sel.value = current || '';
-    // If the saved watch key is a name that is no longer listed, keep it visible.
     if (current && sel.value !== current) {
       const opt = document.createElement('option');
       opt.value = current;
@@ -441,15 +680,25 @@
     }
   }
 
+  function setTab(tab) {
+    activeTab = tab;
+    document.querySelectorAll('#dp-panel [data-tab]').forEach((b) => {
+      b.classList.toggle('dp-tab-active', b.getAttribute('data-tab') === tab);
+    });
+    document.querySelectorAll('#dp-panel .dp-tab-page').forEach((p) => {
+      p.style.display = p.getAttribute('data-page') === tab ? 'block' : 'none';
+    });
+    if (tab === 'live') { refreshWatchSelect(); renderLive(); }
+    if (tab === 'log') renderVoiceLog();
+    if (tab === 'deleted') renderDeleted();
+    if (tab === 'look') markActivePreset();
+  }
+
   function togglePanel() {
     ensurePanel();
     panelOpen = !panelOpen;
     panel.style.display = panelOpen ? 'block' : 'none';
-    if (panelOpen) {
-      refreshWatchSelect();
-      renderVoiceLog();
-      markActivePreset();
-    }
+    if (panelOpen) setTab(activeTab);
   }
 
   function markActivePreset() {
@@ -471,36 +720,65 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><button id="dp-panel-close" title="Close">✕</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-tabs">' +
+      '<button data-tab="live">Live</button>' +
+      '<button data-tab="log">Voice log</button>' +
+      '<button data-tab="deleted">Deleted</button>' +
+      '<button data-tab="look">Look</button>' +
+      '</div>' +
+      '<div class="dp-tab-page" data-page="live">' +
       '<div class="dp-section"><div class="dp-section-title">Watch server</div>' +
       '<select id="dp-watch-guild"></select>' +
-      '<div class="dp-note">Pick a server to track its voice activity. Background tracking needs Discord\u2019s internal data; if that is unavailable the log only covers the server you are viewing.</div></div>' +
+      '<div class="dp-note">Live Now and the voice log follow this server, even while you are in DMs or another server.</div></div>' +
+      '<div class="dp-section"><div class="dp-section-title">Live now</div>' +
+      '<div id="dp-live-list" class="dp-live-list"></div>' +
+      '<div id="dp-live-meta" class="dp-note"></div></div>' +
+      '</div>' +
+      '<div class="dp-tab-page" data-page="log" style="display:none">' +
       '<div class="dp-section"><div class="dp-section-title">Voice log <button id="dp-log-clear">Clear</button></div>' +
       '<div id="dp-log-list" class="dp-log-list"></div>' +
       '<div id="dp-voice-status" class="dp-note"></div></div>' +
+      '</div>' +
+      '<div class="dp-tab-page" data-page="deleted" style="display:none">' +
+      '<div class="dp-section"><div class="dp-section-title">Deleted messages <button id="dp-deleted-clear">Clear</button></div>' +
+      '<div class="dp-note">Only messages you already saw while this tab was open. Deleted before you opened the channel, or while Discord was closed, cannot be recovered.</div>' +
+      '<div id="dp-deleted-list" class="dp-deleted-list"></div></div>' +
+      '</div>' +
+      '<div class="dp-tab-page" data-page="look" style="display:none">' +
       '<div class="dp-section"><div class="dp-section-title">Look</div>' +
       '<div class="dp-presets">' +
+      '<button data-preset="clean">Clean</button>' +
       '<button data-preset="neon">Neon</button>' +
       '<button data-preset="glass">Glass</button>' +
       '<button data-preset="midnight">Midnight</button>' +
       '</div>' +
       '<label>Accent <input type="color" id="dp-accent"></label>' +
       '<label>Background image URL <input type="text" id="dp-bgurl" placeholder="https://..."></label>' +
-      '<div class="dp-note">The accent color tints the background gradient, so changing it changes the whole look. Paste any image URL for a custom background, or leave it empty for the preset gradient.</div></div>' +
+      '<div class="dp-note">Clean is the new default: solid dark, no glow. The accent only tints small highlights.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Settings</div>' +
       '<label><input type="checkbox" id="dp-set-voice"> Voice join/leave log</label>' +
+      '<label><input type="checkbox" id="dp-set-deleted"> Deleted messages</label>' +
+      '<label><input type="checkbox" id="dp-set-live"> Live Now preview</label>' +
       '<label><input type="checkbox" id="dp-set-theme"> Custom look</label>' +
-      '</div>';
+      '</div></div>';
     document.body.appendChild(panel);
 
+    panel.querySelectorAll('[data-tab]').forEach((b) => {
+      b.addEventListener('click', () => setTab(b.getAttribute('data-tab')));
+    });
     panel.querySelector('#dp-panel-close').addEventListener('click', togglePanel);
     panel.querySelector('#dp-log-clear').addEventListener('click', () => { saveLog([]); renderVoiceLog(); });
+    panel.querySelector('#dp-deleted-clear').addEventListener('click', () => { saveDeleted([]); renderDeleted(); });
 
     const watchSel = panel.querySelector('#dp-watch-guild');
     watchSel.addEventListener('change', () => {
       set('watchGuildId', watchSel.value || null);
       voiceState = new Map();
       firstScan = true;
+      liveCache = [];
+      scanVoice();
+      scanLive();
       renderVoiceLog();
     });
 
@@ -519,37 +797,49 @@
     bgInput.addEventListener('change', () => { set('bgUrl', bgInput.value.trim()); applyTheme(); });
 
     const voiceCb = panel.querySelector('#dp-set-voice');
+    const deletedCb = panel.querySelector('#dp-set-deleted');
+    const liveCb = panel.querySelector('#dp-set-live');
     const themeCb = panel.querySelector('#dp-set-theme');
     voiceCb.checked = get('voiceLog');
+    deletedCb.checked = get('deletedLog');
+    liveCb.checked = get('liveNow');
     themeCb.checked = get('themeOn');
     voiceCb.addEventListener('change', () => {
       set('voiceLog', voiceCb.checked);
       if (!voiceCb.checked) { voiceState = new Map(); firstScan = true; }
     });
+    deletedCb.addEventListener('change', () => { set('deletedLog', deletedCb.checked); });
+    liveCb.addEventListener('change', () => { set('liveNow', liveCb.checked); if (!liveCb.checked) liveCache = []; scanLive(); });
     themeCb.addEventListener('change', () => { set('themeOn', themeCb.checked); applyTheme(); });
 
     refreshWatchSelect();
     renderVoiceLog();
+    renderLive();
+    renderDeleted();
     markActivePreset();
     return panel;
   }
 
-  /* ---------------- core UI styles (always on) ---------------- */
+  /* ---------------- core UI styles (always on, cleaner) ---------------- */
   const UI_CSS = [
-    '#dp-fab { position: fixed; right: 16px; bottom: 16px; z-index: 9999; width: 44px; height: 44px; border-radius: 50%; border: none; background: var(--dp-accent, #7c5cff); color: #fff; font-weight: 700; font-size: 14px; cursor: pointer; box-shadow: 0 4px 14px rgba(0,0,0,.4); }',
-    '#dp-fab:hover { filter: brightness(1.15); }',
-    '#dp-panel { position: fixed; right: 16px; bottom: 72px; z-index: 9999; width: 340px; max-height: 70vh; overflow-y: auto; display: none; background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5); font-family: inherit; font-size: 14px; }',
-    '.dp-panel-head { display: flex; justify-content: space-between; align-items: center; padding: 10px 12px; border-bottom: 1px solid #3f4147; }',
-    '.dp-panel-head button { background: none; border: none; color: #dbdee1; cursor: pointer; font-size: 14px; }',
-    '.dp-section { padding: 10px 12px; border-bottom: 1px solid #2b2d31; }',
+    '#dp-fab { position: fixed; right: 16px; bottom: 16px; z-index: 9999; width: 40px; height: 40px; border-radius: 10px; border: 1px solid #232428; background: #1e1f22; color: #dbdee1; font-weight: 700; font-size: 13px; cursor: pointer; box-shadow: 0 4px 12px rgba(0,0,0,.4); }',
+    '#dp-fab:hover { border-color: var(--dp-accent, #5865f2); color: #fff; }',
+    '#dp-panel { position: fixed; right: 16px; bottom: 66px; z-index: 9999; width: 360px; max-height: 72vh; overflow-y: auto; display: none; background: #111214; color: #dbdee1; border: 1px solid #232428; border-radius: 12px; box-shadow: 0 8px 24px rgba(0,0,0,.5); font-family: inherit; font-size: 14px; }',
+    '.dp-panel-head { display: flex; justify-content: space-between; align-items: center; padding: 12px 14px; border-bottom: 1px solid #232428; }',
+    '.dp-panel-head button { background: none; border: none; color: #b5bac1; cursor: pointer; font-size: 13px; }',
+    '.dp-version { color: #949ba4; font-size: 12px; margin-left: auto; margin-right: 8px; }',
+    '.dp-tabs { display: flex; gap: 4px; padding: 8px 10px 0; }',
+    '.dp-tabs button { flex: 1; background: transparent; color: #b5bac1; border: none; border-bottom: 2px solid transparent; padding: 8px 0; cursor: pointer; font-size: 13px; }',
+    '.dp-tabs button.dp-tab-active { color: #fff; border-bottom-color: var(--dp-accent, #5865f2); }',
+    '.dp-section { padding: 12px 14px; border-bottom: 1px solid #232428; }',
     '.dp-section-title { font-weight: 700; margin-bottom: 8px; display: flex; justify-content: space-between; align-items: center; }',
-    '.dp-section label { display: block; margin: 6px 0; }',
-    '.dp-section select, .dp-section input[type="text"] { width: 100%; box-sizing: border-box; background: #2b2d31; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 5px 8px; margin-top: 4px; }',
+    '.dp-section label { display: block; margin: 8px 0; }',
+    '.dp-section select, .dp-section input[type="text"] { width: 100%; box-sizing: border-box; background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 6px 8px; margin-top: 4px; }',
     '.dp-section input[type="color"] { vertical-align: middle; margin-left: 6px; background: none; border: none; width: 40px; height: 26px; padding: 0; cursor: pointer; }',
     '.dp-presets { display: flex; gap: 6px; margin-bottom: 8px; }',
-    '.dp-presets button { flex: 1; background: #2b2d31; color: #dbdee1; border: 1px solid #3f4147; border-radius: 8px; padding: 6px 0; cursor: pointer; font-size: 13px; }',
-    '.dp-presets button.dp-preset-active { border-color: var(--dp-accent, #7c5cff); color: #fff; box-shadow: 0 0 8px var(--dp-accent, #7c5cff); }',
-    '.dp-log-list { max-height: 220px; overflow-y: auto; }',
+    '.dp-presets button { flex: 1; background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 8px; padding: 6px 0; cursor: pointer; font-size: 13px; }',
+    '.dp-presets button.dp-preset-active { border-color: var(--dp-accent, #5865f2); color: #fff; }',
+    '.dp-log-list, .dp-deleted-list, .dp-live-list { max-height: 260px; overflow-y: auto; }',
     '.dp-log-row { padding: 3px 0; }',
     '.dp-time { color: #949ba4; }',
     '.dp-guild { color: #949ba4; font-size: 12px; }',
@@ -557,21 +847,48 @@
     '.dp-leave strong { color: #ed4245; }',
     '.dp-empty { color: #949ba4; }',
     '.dp-note { color: #949ba4; font-size: 12px; margin-top: 8px; }',
-    '#dp-log-clear { background: #2b2d31; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 2px 8px; cursor: pointer; }',
+    '#dp-log-clear, #dp-deleted-clear { background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 2px 8px; cursor: pointer; }',
+    '.dp-live-channel { margin-bottom: 10px; }',
+    '.dp-live-channel-name { font-weight: 700; margin-bottom: 4px; }',
+    '.dp-live-user { padding: 4px 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }',
+    '.dp-dot { width: 8px; height: 8px; border-radius: 50%; background: #3f4147; flex-shrink: 0; }',
+    '.dp-dot-speaking { background: #3ba55d; box-shadow: 0 0 6px #3ba55d; }',
+    '.dp-badge-live { background: #ed4245; color: #fff; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 5px; }',
+    '.dp-badge-speaking { color: #3ba55d; font-size: 12px; }',
+    '.dp-badge-muted { color: #949ba4; font-size: 12px; }',
+    '.dp-watch-btn { background: var(--dp-accent, #5865f2); color: #fff; border: none; border-radius: 6px; padding: 3px 8px; cursor: pointer; font-size: 12px; }',
+    '.dp-deleted-row { padding: 8px 0; border-bottom: 1px solid #232428; }',
+    '.dp-deleted-head { margin-bottom: 2px; }',
+    '.dp-deleted-badge { background: #ed4245; color: #fff; font-size: 11px; font-weight: 700; border-radius: 4px; padding: 1px 5px; }',
+    '.dp-deleted-text { color: #dbdee1; opacity: 0.75; word-break: break-word; }',
+    '.dp-deleted-ghost { background: rgba(237, 66, 69, 0.08); border-left: 3px solid #ed4245; border-radius: 6px; padding: 8px 10px; margin: 6px 16px; color: #dbdee1; font-size: 14px; }',
+    '.dp-deleted-ghost .dp-deleted-text { margin-top: 2px; }',
+    '.dp-deleted-ghost .dp-deleted-time { color: #949ba4; font-size: 12px; }',
     '[id^="chat-messages-"] { position: relative; }'
   ].join('\n');
 
   /* ---------------- boot ---------------- */
   function boot() {
     try {
+      // v3 migration: old default was Neon, switch existing installs to Clean once.
+      if (!GM_getValue('dp_v3_migrated', false)) {
+        if (get('themePreset') === 'neon') set('themePreset', 'clean');
+        set('accent', '#5865f2');
+        GM_setValue('dp_v3_migrated', true);
+      }
       GM_addStyle(UI_CSS);
       ensurePanel();
       applyTheme();
+      subscribeDispatcher();
       setInterval(scanVoice, 2000);
+      setInterval(scanLive, 2000);
+      setInterval(pollMessageStore, 3000);
+      setInterval(subscribeDispatcher, 10000);
       GM_registerMenuCommand('Discord Plus: open panel', togglePanel);
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
+      GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v2.1.0');
+      log('loaded v3.0.0');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }
