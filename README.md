@@ -2,6 +2,17 @@
 
 A Tampermonkey userscript for Discord web.
 
+## v3.0.2 fixes (Nov 19, 2026, local only, not yet pushed)
+
+- **Store discovery fixed:** `findStore` now accepts function exports as well as objects, tries multiple webpack chunk names (and Symbol keys), and injects a page-context `<script>` that stores the webpack require on `window.__dpWpRequire`, retried every 10s until stores are found. Diagnostics now also show chunk / wp / cache size.
+- **Live Now DOM fallback:** `scanLive()` no longer returns early when stores fail, it now falls back to the DOM sidebar scan, so Live Now shows people in voice even in DOM mode.
+- **Watch server dropdown fixed:** the server rail is now parsed from `[data-list-item-id*="guildsnav"]` (guild id after the last `___`), and the current server from the URL is always added as an option, so VALORANT LFG appears when you are in that server.
+- **Background image fixed:** the image URL is now applied with the background shorthand to `html`, `body`, `[class*="appMount_"]` and `[class*="app_"]` (cover, center, fixed), and Discord's background layers are made transparent when an image is set, for all presets including Clean and Midnight.
+- **Voice log duplicates fixed:** a leave is only logged after a user has been missing for 3 consecutive scans (about 6 seconds). Empty scans and watched-server mismatches no longer clear state or log false leaves. `firstScan` only resets at boot or when the watch server changes.
+- **Deleted messages DOM fallback:** a `MutationObserver` on the chat area watches for a single message node being removed, waits 2 seconds, checks it was not re-added, then calls the existing delete logic. Bulk removals (scrolling / channel switch) are ignored. The dispatcher subscription remains the primary path when it works.
+- **Diagnostics:** fixed the missing slash, now reads "dispatcher no / subscribed no", plus new chunk / wp / cache fields.
+- **Accent picker:** a hex text input (`#rrggbb`) now sits next to the colour picker in the Look tab, validated and synced with the colour input.
+
 ## v3.0 features
 
 1. **Live Now** — see who is in voice, who is actually speaking, and who is streaming, without joining the call. Pick a server under Watch server and the Live tab follows it even while you are in DMs or another server. Streaming users get a LIVE badge and a Watch button, which opens Discord's own Watch Stream view.

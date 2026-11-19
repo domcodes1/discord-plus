@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      3.0.1
+// @version      3.0.2
 // @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
@@ -84,14 +84,50 @@
     } catch (e) { /* ignore */ }
     return window;
   }
+  const WP_CHUNK_NAMES = ['webpackChunkdiscord_app', 'webpackChunkdiscord', 'webpackChunkclient_app', 'webpackChunkdiscord_client'];
+  function getChunkArray(pw) {
+    if (!pw) return null;
+    for (const name of WP_CHUNK_NAMES) {
+      if (pw[name] && typeof pw[name].push === 'function') return pw[name];
+    }
+    // Fallback: any window key starting with webpackChunk, plus Symbol keys.
+    try {
+      for (const k of Object.keys(pw)) {
+        if (k.indexOf('webpackChunk') === 0 && pw[k] && typeof pw[k].push === 'function') return pw[k];
+      }
+      for (const s of Object.getOwnPropertySymbols(pw)) {
+        const v = pw[s];
+        if (v && typeof v.push === 'function') return v;
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function injectWpRequire() {
+    // Tampermonkey's sandbox cannot always reach the page webpack require
+    // directly, so inject a plain <script> into page context that grabs it
+    // and stores it on window.__dpWpRequire for the userscript to read.
+    try {
+      const pw = getPageWindow();
+      if (pw && pw.__dpWpRequire) return true;
+      if (typeof document === 'undefined' || !document.documentElement) return false;
+      const s = document.createElement('script');
+      s.textContent = '(function(){try{var names=["webpackChunkdiscord_app","webpackChunkdiscord","webpackChunkclient_app","webpackChunkdiscord_client"];for(var i=0;i<names.length;i++){var c=window[names[i]];if(c&&typeof c.push==="function"){c.push([["dp-inject"],{},function(r){window.__dpWpRequire=r;}]);return;}}var keys=Object.keys(window);for(var j=0;j<keys.length;j++){if(keys[j].indexOf("webpackChunk")===0){var c2=window[keys[j]];if(c2&&typeof c2.push==="function"){c2.push([["dp-inject"],{},function(r){window.__dpWpRequire=r;}]);return;}}}}catch(e){}})();';
+      document.documentElement.appendChild(s);
+      s.remove();
+      return !!(pw && pw.__dpWpRequire);
+    } catch (e) { return false; }
+  }
   function getWpRequire() {
     if (wpRequire) return wpRequire;
     const pw = getPageWindow();
-    const chunk = (pw && pw.webpackChunkdiscord_app) || window.webpackChunkdiscord_app;
+    if (pw && pw.__dpWpRequire) { wpRequire = pw.__dpWpRequire; return wpRequire; }
+    const chunk = getChunkArray(pw) || getChunkArray(window);
     if (!chunk || typeof chunk.push !== 'function') return null;
     try {
       chunk.push([['dp' + Math.random().toString(36).slice(2)], {}, (req) => { wpRequire = req; }]);
     } catch (e) { return null; }
+    // The injected page-context require is the fallback if the direct push did not run.
+    if (!wpRequire && pw && pw.__dpWpRequire) wpRequire = pw.__dpWpRequire;
     return wpRequire;
   }
   function findStore(props, anyOf) {
@@ -101,9 +137,12 @@
     for (const id in cache) {
       const mod = cache[id];
       if (!mod || !mod.exports) continue;
-      const candidates = [mod.exports, mod.exports.default, mod.exports.Z];
+      // Exports can be an object OR a function with properties attached.
+      const exp = mod.exports;
+      const candidates = [exp, exp && exp.default, exp && exp.Z];
       for (const cand of candidates) {
-        if (!cand || typeof cand !== 'object') continue;
+        if (!cand) continue;
+        if (typeof cand !== 'object' && typeof cand !== 'function') continue;
         if (anyOf) {
           if (props.some((p) => typeof cand[p] === 'function')) return cand;
         } else {
@@ -156,6 +195,19 @@
   }
   function listGuildsFromRail() {
     const out = [];
+    // Primary: Discord's server rail items carry data-list-item-id like
+    // "guildsnav___828370043867496531" and an aria-label with the server name.
+    document.querySelectorAll('[data-list-item-id*="guildsnav"]').forEach((el) => {
+      const raw = el.getAttribute('data-list-item-id') || '';
+      const parts = raw.split('___');
+      const id = parts.length ? parts[parts.length - 1] : '';
+      if (!/^\d{10,}$/.test(id)) return;
+      let label = (el.getAttribute('aria-label') || '').trim();
+      label = label.replace(/,\s*\d+ unread.*$/i, '').replace(/,\s*muted$/i, '').trim();
+      if (!label || out.some((g) => g.id === id)) return;
+      out.push({ id, name: label });
+    });
+    // Fallback: any aria-label in the server rail.
     const rail = document.querySelector('nav[aria-label="Servers"]') || document.querySelector('[class*="guilds_"]');
     const scope = rail || document;
     scope.querySelectorAll('[aria-label]').forEach((el) => {
@@ -169,9 +221,21 @@
     return out;
   }
   function listGuilds() {
-    const fromStores = listGuildsFromStores();
-    if (fromStores.length) return fromStores;
-    return listGuildsFromRail();
+    const merged = [];
+    const push = (g) => {
+      if (!g || !g.name) return;
+      if (g.id && merged.some((x) => x.id === g.id)) return;
+      if (!g.id && merged.some((x) => x.name === g.name)) return;
+      merged.push(g);
+    };
+    listGuildsFromStores().forEach(push);
+    listGuildsFromRail().forEach(push);
+    // Always include the server the user is currently in, even if the
+    // stores and the rail both missed it (e.g. it is in a folder).
+    const curId = currentGuildIdFromUrl();
+    const curName = activeGuildName();
+    if (curId && curName) push({ id: curId, name: curName });
+    return merged;
   }
   function guildName(id) {
     if (!id) return 'DM';
@@ -201,6 +265,10 @@
   let voiceState = new Map();
   let firstScan = true;
   let trackingMode = 'dom';
+  // Grace period: a user must be missing for 3 consecutive scans
+  // (about 6 seconds) before a leave is logged. This stops duplicate
+  // joins and false leave/join pairs from transient empty DOM scans.
+  let missingCounts = new Map();
 
   function loadLog() {
     try { return JSON.parse(GM_getValue(LOG_KEY, '[]')); } catch (e) { return []; }
@@ -218,15 +286,29 @@
     if (firstScan) {
       voiceState = now;
       firstScan = false;
+      missingCounts = new Map();
       return;
     }
-    if (now.size === 0 && voiceState.size > 0) {
-      voiceState = now;
-      return;
-    }
-    now.forEach((v, k) => { if (!voiceState.has(k)) addVoiceEvent('join', v.guild, v.channel, v.user); });
-    voiceState.forEach((v, k) => { if (!now.has(k)) addVoiceEvent('leave', v.guild, v.channel, v.user); });
-    voiceState = now;
+    // Empty scan: the sidebar may not have rendered yet, or the user just
+    // switched views. Do NOT clear state or log mass leaves; just skip it.
+    if (now.size === 0) return;
+    const next = new Map(voiceState);
+    now.forEach((v, k) => {
+      if (!voiceState.has(k)) addVoiceEvent('join', v.guild, v.channel, v.user);
+      if (missingCounts.has(k)) missingCounts.delete(k);
+      next.set(k, v);
+    });
+    voiceState.forEach((v, k) => {
+      if (now.has(k)) return;
+      const count = (missingCounts.get(k) || 0) + 1;
+      missingCounts.set(k, count);
+      if (count >= 3) {
+        addVoiceEvent('leave', v.guild, v.channel, v.user);
+        missingCounts.delete(k);
+        next.delete(k);
+      }
+    });
+    voiceState = next;
   }
 
   function scanVoiceStores() {
@@ -305,8 +387,8 @@
     const currentGuild = currentGuildIdFromUrl();
     const currentName = activeGuildName() || guildName(currentGuild);
     if (watchKey() && !watchMatches(currentGuild, currentName)) {
-      voiceState = new Map();
-      firstScan = false;
+      // Watching a different server: skip this scan, do not clear state
+      // or log false leaves for the watched server.
       trackingMode = 'dom';
       return;
     }
@@ -360,7 +442,9 @@
   }
   function scanLive() {
     if (!get('liveNow')) { liveCache = []; return; }
-    if (!ensureStores()) return;
+    // Do NOT return early when stores fail: fall through to the DOM
+    // sidebar scan below, so Live Now works in DOM mode too.
+    ensureStores();
     const speakingDom = speakingFromDOM();
     const streams = streamOwners();
     const byChannel = new Map();
@@ -520,7 +604,20 @@
     } catch (e) { /* ignore */ }
   }
   function dpDiagnostics() {
+    const pw = getPageWindow();
+    let chunkExists = false;
+    try {
+      chunkExists = !!(pw && (pw.webpackChunkdiscord_app || getChunkArray(pw)));
+    } catch (e) { chunkExists = false; }
+    let cacheSize = 0;
+    try {
+      const req = wpRequire || (pw && pw.__dpWpRequire);
+      if (req && req.c) cacheSize = Object.keys(req.c).length;
+    } catch (e) { cacheSize = 0; }
     return {
+      chunkExists,
+      wpFound: !!(wpRequire || (pw && pw.__dpWpRequire)),
+      cacheSize,
       voiceStore: !!stores.voice,
       channelStore: !!stores.channel,
       userStore: !!stores.user,
@@ -538,7 +635,7 @@
     const el = document.getElementById('dp-diag');
     if (!el) return;
     const d = dpDiagnostics();
-    el.textContent = 'Diag: voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
+    el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
   }
   function onMessageDelete(channelId, messageId) {
     if (!get('deletedLog')) return;
@@ -556,6 +653,56 @@
     saveDeleted(entries);
     renderDeleted();
     insertDeletedGhost(entry);
+  }
+  // DOM fallback for deleted messages: watch the chat area for a single
+  // message node being removed. Bulk removals (many nodes at once) are
+  // scrolling / channel switches, not deletes, so they are ignored.
+  let deletedObserver = null;
+  function extractMsgIdFromNode(node) {
+    if (!node || typeof node.getAttribute !== 'function') return null;
+    const idAttr = node.getAttribute('id') || node.getAttribute('data-list-item-id') || '';
+    const m = String(idAttr).match(/(\d{17,20})/g);
+    if (m && m.length) return m[m.length - 1];
+    // The removed node may be a wrapper; check its descendants.
+    try {
+      const inner = node.querySelector && node.querySelector('[id*="chat-messages-"], [data-list-item-id]');
+      if (inner) {
+        const innerAttr = inner.getAttribute('id') || inner.getAttribute('data-list-item-id') || '';
+        const im = String(innerAttr).match(/(\d{17,20})/g);
+        if (im && im.length) return im[im.length - 1];
+      }
+    } catch (e) { /* ignore */ }
+    return null;
+  }
+  function setupDeletedObserver() {
+    if (deletedObserver) return true;
+    if (!get('deletedLog')) return false;
+    const target = document.querySelector('[class*="messagesWrapper_"]') || document.querySelector('[class*="chatContent_"]') || document.body;
+    if (!target || typeof MutationObserver === 'undefined') return false;
+    try {
+      deletedObserver = new MutationObserver((mutations) => {
+        for (const mut of mutations) {
+          if (!mut.removedNodes || !mut.removedNodes.length) continue;
+          if (mut.removedNodes.length > 3) continue; // bulk removal, ignore
+          mut.removedNodes.forEach((node) => {
+            const msgId = extractMsgIdFromNode(node);
+            if (!msgId || !msgCache.has(msgId)) return;
+            const channelId = (msgCache.get(msgId) && msgCache.get(msgId).channelId) || currentChannelIdFromUrl();
+            setTimeout(() => {
+              // If the node came back (re-render / scroll), it was not a delete.
+              try {
+                if (document.querySelector('[id*="' + msgId + '"], [data-list-item-id*="' + msgId + '"]')) return;
+              } catch (e) { /* ignore */ }
+              if (!msgCache.has(msgId)) return;
+              onMessageDelete(channelId, msgId);
+            }, 2000);
+          });
+        }
+      });
+      deletedObserver.observe(target, { childList: true, subtree: true });
+      log('deleted-message DOM observer on');
+      return true;
+    } catch (e) { deletedObserver = null; return false; }
   }
   function subscribeDispatcher() {
     if (dispatcherSubscribed) return;
@@ -602,12 +749,21 @@
     css.push('a[href="/shop"] { display: none !important; }');
     css.push('[aria-label="Shop"] { display: none !important; }');
     css.push(':root { --brand-500: ' + accent + ' !important; --brand-600: ' + accentDark + ' !important; --brand-400: ' + accentLight + ' !important; --dp-accent: ' + accent + ' !important; }');
-    if (preset === 'clean') {
+    if (bgUrl) {
+      // Background image wins over every preset. Use the background
+      // shorthand (not just background-image) on html, body and every
+      // Discord app root, and make Discord's own background layers
+      // transparent so the image is not hidden behind a solid/gradient.
+      const safeUrl = bgUrl.replace(/"/g, '').replace(/'/g, '');
+      const bgDecl = 'background: url("' + safeUrl + '") center / cover no-repeat fixed !important; background-size: cover !important; background-position: center center !important; background-attachment: fixed !important;';
+      css.push('html, body, [class*="appMount_"], [class*="app_"] { ' + bgDecl + ' }');
+      css.push('[class*="appMount_"], [class*="app_"], [class*="bg_"], [class*="background_"] { background-color: transparent !important; }');
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"], [class*="container_"] { background-color: transparent !important; }');
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background-image: none !important; }');
+      css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 10px !important; }');
+    } else if (preset === 'clean') {
       // Clean: solid dark, no loud gradient, no glow. Accent only for small highlights.
       css.push('[class*="appMount_"] { background: #111214 !important; }');
-      if (bgUrl) {
-        css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
-      }
       css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: transparent !important; }');
       css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 10px !important; }');
     } else {
@@ -619,11 +775,7 @@
       } else {
         gradient = 'linear-gradient(135deg, ' + accentDeep + ' 0%, ' + accent + ' 50%, #0a1a3a 100%)';
       }
-      if (bgUrl) {
-        css.push('[class*="appMount_"] { background-image: url("' + bgUrl.replace(/"/g, '') + '") !important; background-size: cover !important; background-position: center !important; }');
-      } else {
-        css.push('[class*="appMount_"] { background: ' + gradient + ' !important; }');
-      }
+      css.push('[class*="appMount_"] { background: ' + gradient + ' !important; }');
       css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background: rgba(8, 8, 18, 0.35) !important; backdrop-filter: blur(10px); }');
       css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 12px !important; box-shadow: 0 0 6px ' + accent + '44 !important; }');
     }
@@ -771,7 +923,7 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.1</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.2</span><button id="dp-panel-close" title="Close">X</button></div>' +
       '<div class="dp-tabs">' +
       '<button data-tab="live">Live</button>' +
       '<button data-tab="log">Voice log</button>' +
@@ -804,7 +956,7 @@
       '<button data-preset="glass">Glass</button>' +
       '<button data-preset="midnight">Midnight</button>' +
       '</div>' +
-      '<label>Accent <input type="color" id="dp-accent"></label>' +
+      '<label>Accent <input type="color" id="dp-accent"> <input type="text" id="dp-accent-hex" placeholder="#5865f2" maxlength="7" spellcheck="false"></label>' +
       '<label>Background image URL <input type="text" id="dp-bgurl" placeholder="https://..."></label>' +
       '<div class="dp-note">Clean is the new default: solid dark, no glow. The accent only tints small highlights.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Diagnostics</div>' +
@@ -830,6 +982,7 @@
       set('watchGuildId', watchSel.value || null);
       voiceState = new Map();
       firstScan = true;
+      missingCounts = new Map();
       liveCache = [];
       scanVoice();
       scanLive();
@@ -844,8 +997,34 @@
       });
     });
     const accentInput = panel.querySelector('#dp-accent');
+    const accentHex = panel.querySelector('#dp-accent-hex');
     accentInput.value = get('accent');
-    accentInput.addEventListener('input', () => { set('accent', accentInput.value); applyTheme(); });
+    if (accentHex) {
+      accentHex.value = get('accent');
+      const applyHex = () => {
+        let v = (accentHex.value || '').trim();
+        if (!v.startsWith('#')) v = '#' + v;
+        if (/^#[0-9a-fA-F]{6}$/.test(v)) {
+          v = v.toLowerCase();
+          set('accent', v);
+          accentInput.value = v;
+          applyTheme();
+          accentHex.style.borderColor = '';
+        } else if (/^#[0-9a-fA-F]{3}$/.test(v)) {
+          const expanded = '#' + v.slice(1).split('').map((c) => c + c).join('').toLowerCase();
+          set('accent', expanded);
+          accentInput.value = expanded;
+          accentHex.value = expanded;
+          applyTheme();
+          accentHex.style.borderColor = '';
+        } else {
+          accentHex.style.borderColor = '#ed4245';
+        }
+      };
+      accentHex.addEventListener('change', applyHex);
+      accentHex.addEventListener('input', () => { accentHex.style.borderColor = ''; });
+    }
+    accentInput.addEventListener('input', () => { set('accent', accentInput.value); if (accentHex) accentHex.value = accentInput.value; applyTheme(); });
     const bgInput = panel.querySelector('#dp-bgurl');
     bgInput.value = get('bgUrl');
     bgInput.addEventListener('change', () => { set('bgUrl', bgInput.value.trim()); applyTheme(); });
@@ -860,7 +1039,7 @@
     themeCb.checked = get('themeOn');
     voiceCb.addEventListener('change', () => {
       set('voiceLog', voiceCb.checked);
-      if (!voiceCb.checked) { voiceState = new Map(); firstScan = true; }
+      if (!voiceCb.checked) { voiceState = new Map(); firstScan = true; missingCounts = new Map(); }
     });
     deletedCb.addEventListener('change', () => { set('deletedLog', deletedCb.checked); });
     liveCb.addEventListener('change', () => { set('liveNow', liveCb.checked); if (!liveCb.checked) liveCache = []; scanLive(); });
@@ -890,6 +1069,7 @@
     '.dp-section label { display: block; margin: 8px 0; }',
     '.dp-section select, .dp-section input[type="text"] { width: 100%; box-sizing: border-box; background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 6px 8px; margin-top: 4px; }',
     '.dp-section input[type="color"] { vertical-align: middle; margin-left: 6px; background: none; border: none; width: 40px; height: 26px; padding: 0; cursor: pointer; }',
+    '#dp-accent-hex { width: 90px !important; display: inline-block; margin-left: 6px; font-family: monospace; }',
     '.dp-presets { display: flex; gap: 6px; margin-bottom: 8px; }',
     '.dp-presets button { flex: 1; background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 8px; padding: 6px 0; cursor: pointer; font-size: 13px; }',
     '.dp-presets button.dp-preset-active { border-color: var(--dp-accent, #5865f2); color: #fff; }',
@@ -933,19 +1113,31 @@
       GM_addStyle(UI_CSS);
       ensurePanel();
       applyTheme();
+      injectWpRequire();
+      ensureStores();
       subscribeDispatcher();
+      setupDeletedObserver();
       setInterval(scanVoice, 2000);
       setInterval(scanLive, 2000);
       setInterval(pollMessageStore, 3000);
       setInterval(scanMessagesDOM, 2000);
       setInterval(subscribeDispatcher, 10000);
       setInterval(renderDiagnostics, 3000);
+      // Retry the page-context injection every 10s until stores are found.
+      setInterval(() => {
+        if (!stores.voice || !stores.message || !stores.dispatcher) {
+          injectWpRequire();
+          ensureStores();
+          subscribeDispatcher();
+        }
+        if (!deletedObserver) setupDeletedObserver();
+      }, 10000);
       renderDiagnostics();
       GM_registerMenuCommand('Discord Plus: open panel', togglePanel);
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v3.0.1');
+      log('loaded v3.0.2');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }
