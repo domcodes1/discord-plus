@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      3.0.2
+// @version      3.0.3
 // @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
@@ -77,6 +77,9 @@
   let wpRequire = null;
   let stores = { voice: null, channel: null, user: null, guild: null, message: null, dispatcher: null, stream: null, speaking: null };
   let lastStoreAttempt = 0;
+  // Diagnostics for the req.m factory search (v3.0.3).
+  let mSizeCache = 0;
+  let mFoundVoiceFactory = false;
 
   function getPageWindow() {
     try {
@@ -130,26 +133,54 @@
     if (!wpRequire && pw && pw.__dpWpRequire) wpRequire = pw.__dpWpRequire;
     return wpRequire;
   }
+  function storeMatches(cand, props, anyOf) {
+    if (!cand) return false;
+    if (typeof cand !== 'object' && typeof cand !== 'function') return false;
+    if (anyOf) return props.some((p) => typeof cand[p] === 'function');
+    return props.every((p) => typeof cand[p] === 'function');
+  }
   function findStore(props, anyOf) {
     const req = getWpRequire();
-    if (!req || !req.c) return null;
-    const cache = req.c;
-    for (const id in cache) {
-      const mod = cache[id];
-      if (!mod || !mod.exports) continue;
-      // Exports can be an object OR a function with properties attached.
-      const exp = mod.exports;
-      const candidates = [exp, exp && exp.default, exp && exp.Z];
-      for (const cand of candidates) {
-        if (!cand) continue;
-        if (typeof cand !== 'object' && typeof cand !== 'function') continue;
-        if (anyOf) {
-          if (props.some((p) => typeof cand[p] === 'function')) return cand;
-        } else {
-          if (props.every((p) => typeof cand[p] === 'function')) return cand;
+    if (!req) return null;
+    // First: the loaded module cache, req.c (existing path).
+    if (req.c) {
+      const cache = req.c;
+      for (const id in cache) {
+        const mod = cache[id];
+        if (!mod || !mod.exports) continue;
+        const exp = mod.exports;
+        const candidates = [exp, exp && exp.default, exp && exp.Z];
+        for (const cand of candidates) {
+          if (storeMatches(cand, props, anyOf)) return cand;
         }
       }
     }
+    // Second (v3.0.3): the module factories, req.m. A store that lives
+    // in .m but has not been loaded into .c yet cannot be found by the
+    // cache search alone. Check the factory source for the wanted
+    // method names, then instantiate it with req(id) and check exports.
+    try {
+      const factories = req.m || {};
+      const ids = Object.keys(factories);
+      mSizeCache = ids.length;
+      for (const id of ids) {
+        const factory = factories[id];
+        if (typeof factory !== 'function') continue;
+        let src = '';
+        try { src = Function.prototype.toString.call(factory); } catch (e) { continue; }
+        const wants = anyOf ? props.some((p) => src.indexOf(p) !== -1) : props.every((p) => src.indexOf(p) !== -1);
+        if (!wants) continue;
+        if (props.indexOf('getVoiceStatesForChannel') !== -1) mFoundVoiceFactory = true;
+        let mod;
+        try { mod = req(id); } catch (e) { continue; }
+        if (!mod) continue;
+        const exp = mod.exports || mod;
+        const candidates = [exp, exp && exp.default, exp && exp.Z];
+        for (const cand of candidates) {
+          if (storeMatches(cand, props, anyOf)) return cand;
+        }
+      }
+    } catch (e) { /* ignore */ }
     return null;
   }
   function ensureStores() {
@@ -364,23 +395,58 @@
     return true;
   }
 
-  function findChannelName(row) {
+  function cleanAriaChannelName(label) {
+    // Live label example: "📌 compy wompy (voice channel), unread, cute fat boy, XX, Command, and 3 others, Private Channel (locked)"
+    // "(voice channel)" is in the MIDDLE, not at the end, so a trailing
+    // replace never strips it. Cut at " (voice channel)" and at ", unread".
+    let s = String(label || '');
+    const vc = s.indexOf(' (voice channel)');
+    if (vc !== -1) s = s.slice(0, vc);
+    const unread = s.indexOf(', unread');
+    if (unread !== -1) s = s.slice(0, unread);
+    return s.trim() || null;
+  }
+  function findChannelInfo(row) {
     let el = row.parentElement;
     while (el && el !== document.body) {
       const cls = typeof el.className === 'string' ? el.className : '';
       if (cls.indexOf('containerDefault') !== -1) {
+        // Stable id, if the container or its link carries one.
+        let id = null;
         const link = el.querySelector('a[aria-label]');
-        if (link) {
-          const label = link.getAttribute('aria-label') || '';
-          return label.replace(/\s*\(voice channel\)\s*$/i, '').trim() || null;
+        const idAttrs = [];
+        if (el.getAttribute) { idAttrs.push(el.getAttribute('data-list-item-id'), el.getAttribute('id')); }
+        if (link && link.getAttribute) { idAttrs.push(link.getAttribute('data-list-item-id'), link.getAttribute('id')); }
+        for (const a of idAttrs) {
+          const m = String(a || '').match(/(\d{17,20})/g);
+          if (m && m.length) { id = m[m.length - 1]; break; }
         }
-        const nameEl = el.querySelector('[class*="name"]');
-        if (nameEl && nameEl.textContent.trim()) return nameEl.textContent.trim();
-        return null;
+        // Name: prefer the clean name element inside the channel link.
+        // The link only holds the channel header, never the voice users.
+        let name = null;
+        if (link) {
+          const nameEl = link.querySelector('[class*="name"]');
+          if (nameEl && nameEl.textContent.trim()) name = nameEl.textContent.trim();
+        }
+        if (!name) {
+          // Fallback: first name-ish element in the container that is
+          // not inside a voice user row.
+          const candidates = el.querySelectorAll('[class*="name"]');
+          for (const c of candidates) {
+            if (c.closest && c.closest('[class*="voiceUser"]')) continue;
+            if (c.textContent && c.textContent.trim()) { name = c.textContent.trim(); break; }
+          }
+        }
+        // Last fallback: the aria-label, cut at " (voice channel)" and ", unread".
+        if (!name && link) name = cleanAriaChannelName(link.getAttribute('aria-label') || '');
+        return { name: name || null, id: id || null };
       }
       el = el.parentElement;
     }
-    return null;
+    return { name: null, id: null };
+  }
+  function findChannelName(row) {
+    return findChannelInfo(row).name;
   }
 
   function scanVoiceDOM() {
@@ -400,9 +466,13 @@
       const nameEl = row.querySelector('[class*="username"]');
       const user = nameEl ? nameEl.textContent.trim() : '';
       if (!user) return;
-      const channel = findChannelName(row) || 'voice';
+      const info = findChannelInfo(row);
+      const channel = info.name || 'voice';
+      // Stable key: channel id when available, else the clean name.
+      // Never use the aria-label occupant list / unread state in the key.
+      const chanKey = info.id || channel;
       const gid = currentGuild || 'unknown';
-      now.set(gid + '|' + channel + '|' + user, { guild: currentName, guildId: gid, channel, user });
+      now.set(gid + '|' + chanKey + '|' + user, { guild: currentName, guildId: gid, channel, user });
     });
     trackingMode = 'dom';
     diffVoice(now);
@@ -424,8 +494,30 @@
       const nameEl = row.querySelector('[class*="username"]');
       const name = nameEl ? nameEl.textContent.trim() : '';
       if (!name) return;
-      const speaking = !!row.querySelector('[class*="avatarSpeaking"], [class*="speaking"]');
+      let speaking = !!row.querySelector('[class*="avatarSpeaking"], [class*="speaking"]');
+      if (!speaking) {
+        // Extra checks, kept alongside the class check, not replacing it.
+        try {
+          const avatar = row.querySelector('[class*="avatar"]');
+          const style = avatar ? (avatar.getAttribute('style') || '') : '';
+          if (style.indexOf('3ba55d') !== -1 || style.indexOf('59, 165, 93') !== -1 || style.indexOf('59,165,93') !== -1) speaking = true;
+        } catch (e) { /* ignore */ }
+        if (!speaking && row.textContent && row.textContent.indexOf('Speaking') !== -1) speaking = true;
+      }
       out.set(name, speaking);
+    });
+    return out;
+  }
+  function streamFromDOM() {
+    // LIVE is a separate red pill on the right of the voiceUser row,
+    // not part of the button name, so check the row itself.
+    const out = new Map();
+    document.querySelectorAll('[class*="voiceUser"]').forEach((row) => {
+      const nameEl = row.querySelector('[class*="username"]');
+      const name = nameEl ? nameEl.textContent.trim() : '';
+      if (!name) return;
+      const streaming = (row.textContent && row.textContent.indexOf('LIVE') !== -1) || !!row.querySelector('[class*="live"], [class*="Live"]');
+      out.set(name, streaming);
     });
     return out;
   }
@@ -446,6 +538,7 @@
     // sidebar scan below, so Live Now works in DOM mode too.
     ensureStores();
     const speakingDom = speakingFromDOM();
+    const streamingDom = streamFromDOM();
     const streams = streamOwners();
     const byChannel = new Map();
     const addUser = (guild, guildId, channelId, channelName, userId, state) => {
@@ -458,7 +551,7 @@
         if (stores.speaking && typeof stores.speaking.isSpeaking === 'function') speaking = !!stores.speaking.isSpeaking(userId);
       } catch (e) { /* ignore */ }
       if (!speaking) speaking = speakingDom.get(name) || false;
-      const streaming = !!(state && (state.selfStream || state.streaming)) || streams.has(String(userId));
+      const streaming = !!(state && (state.selfStream || state.streaming)) || streams.has(String(userId)) || streamingDom.get(name) || false;
       const muted = !!(state && (state.selfMute || state.mute));
       byChannel.get(key).users.push({ user: name, userId: String(userId), speaking, streaming, muted });
     };
@@ -489,13 +582,14 @@
         const nameEl = row.querySelector('[class*="username"]');
         const user = nameEl ? nameEl.textContent.trim() : '';
         if (!user) return;
-        const channel = findChannelName(row) || 'voice';
+        const info = findChannelInfo(row);
+        const channel = info.name || 'voice';
         const gid = currentGuildIdFromUrl();
         const guild = activeGuildName() || guildName(gid);
         if (!watchMatches(gid, guild)) return;
-        const key = channel;
+        const key = info.id || channel;
         if (!byChannel.has(key)) byChannel.set(key, { channel, guild, users: [] });
-        byChannel.get(key).users.push({ user, userId: '', speaking: speakingDom.get(user) || false, streaming: false, muted: false });
+        byChannel.get(key).users.push({ user, userId: '', speaking: speakingDom.get(user) || false, streaming: streamingDom.get(user) || false, muted: false });
       });
     }
     liveCache = Array.from(byChannel.values()).sort((a, b) => a.channel.localeCompare(b.channel));
@@ -618,6 +712,8 @@
       chunkExists,
       wpFound: !!(wpRequire || (pw && pw.__dpWpRequire)),
       cacheSize,
+      mSize: mSizeCache,
+      mFound: mFoundVoiceFactory,
       voiceStore: !!stores.voice,
       channelStore: !!stores.channel,
       userStore: !!stores.user,
@@ -635,7 +731,56 @@
     const el = document.getElementById('dp-diag');
     if (!el) return;
     const d = dpDiagnostics();
-    el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
+    el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / m ' + d.mSize + ' / mFound ' + (d.mFound ? 'yes' : 'no') + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
+  }
+  // In-script background diagnostic (v3.0.3): DevTools cannot be opened
+  // in Dominic's browser, so this button reports, inside the panel,
+  // whether appMount exists, what its computed background is, and
+  // whether the saved image URL actually loads. Plain Image(), no grant.
+  function testBackground() {
+    const out = document.getElementById('dp-bg-diag');
+    const bgUrl = (get('bgUrl') || '').trim();
+    if (!bgUrl) {
+      if (out) out.textContent = 'Background test: no background URL saved. Paste a URL above first.';
+      return;
+    }
+    let appMount = null;
+    try { appMount = document.querySelector('[class*="appMount_"]'); } catch (e) { appMount = null; }
+    const appCls = appMount ? String(appMount.className || '').slice(0, 80) : '';
+    let appBgImg = 'n/a', appBgColor = 'n/a', bodyBgImg = 'n/a', bodyBgColor = 'n/a';
+    try {
+      if (appMount) { const cs = getComputedStyle(appMount); appBgImg = cs.backgroundImage; appBgColor = cs.backgroundColor; }
+    } catch (e) { appBgImg = 'error'; }
+    try {
+      const bs = getComputedStyle(document.body);
+      bodyBgImg = bs.backgroundImage;
+      bodyBgColor = bs.backgroundColor;
+    } catch (e) { bodyBgImg = 'error'; }
+    const base = 'Background test: appMount ' + (appMount ? 'found (' + appCls + ')' : 'NOT FOUND') + ' / appMount bg ' + appBgImg + ' / ' + appBgColor + ' / body bg ' + bodyBgImg + ' / ' + bodyBgColor + ' / ';
+    if (out) out.textContent = base + 'loading image...';
+    let done = false;
+    const img = new Image();
+    const timer = setTimeout(() => {
+      if (done) return;
+      done = true;
+      if (out) out.textContent = base + 'image TIMEOUT after 5s (did not load, may be blocked or slow) / url ' + bgUrl;
+    }, 5000);
+    img.onload = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (out) out.textContent = base + 'image LOADED ' + img.naturalWidth + 'x' + img.naturalHeight + ' / url ' + bgUrl;
+    };
+    img.onerror = () => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      if (out) out.textContent = base + 'image FAILED to load (onerror) / url ' + bgUrl;
+    };
+    try { img.src = bgUrl; } catch (e) {
+      clearTimeout(timer);
+      if (out) out.textContent = base + 'image error starting load / url ' + bgUrl;
+    }
   }
   function onMessageDelete(channelId, messageId) {
     if (!get('deletedLog')) return;
@@ -756,9 +901,11 @@
       // transparent so the image is not hidden behind a solid/gradient.
       const safeUrl = bgUrl.replace(/"/g, '').replace(/'/g, '');
       const bgDecl = 'background: url("' + safeUrl + '") center / cover no-repeat fixed !important; background-size: cover !important; background-position: center center !important; background-attachment: fixed !important;';
+      css.push(':root { --background-primary: transparent !important; --background-secondary: transparent !important; --background-tertiary: transparent !important; --background-floating: transparent !important; --background-mobile-primary: transparent !important; --background-mobile-secondary: transparent !important; }');
       css.push('html, body, [class*="appMount_"], [class*="app_"] { ' + bgDecl + ' }');
       css.push('[class*="appMount_"], [class*="app_"], [class*="bg_"], [class*="background_"] { background-color: transparent !important; }');
       css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"], [class*="container_"] { background-color: transparent !important; }');
+      css.push('[class*="chat_"] [class*="container_"], [class*="chat_"] { background-color: transparent !important; }');
       css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background-image: none !important; }');
       css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 10px !important; }');
     } else if (preset === 'clean') {
@@ -923,7 +1070,7 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.2</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.3</span><button id="dp-panel-close" title="Close">X</button></div>' +
       '<div class="dp-tabs">' +
       '<button data-tab="live">Live</button>' +
       '<button data-tab="log">Voice log</button>' +
@@ -958,6 +1105,8 @@
       '</div>' +
       '<label>Accent <input type="color" id="dp-accent"> <input type="text" id="dp-accent-hex" placeholder="#5865f2" maxlength="7" spellcheck="false"></label>' +
       '<label>Background image URL <input type="text" id="dp-bgurl" placeholder="https://..."></label>' +
+      '<button id="dp-bg-test">Test background</button>' +
+      '<div id="dp-bg-diag" class="dp-note">Background test not run yet.</div>' +
       '<div class="dp-note">Clean is the new default: solid dark, no glow. The accent only tints small highlights.</div></div>' +
       '<div class="dp-section"><div class="dp-section-title">Diagnostics</div>' +
       '<div id="dp-diag" class="dp-note">Diag: loading...</div>' +
@@ -1028,6 +1177,8 @@
     const bgInput = panel.querySelector('#dp-bgurl');
     bgInput.value = get('bgUrl');
     bgInput.addEventListener('change', () => { set('bgUrl', bgInput.value.trim()); applyTheme(); });
+    const bgTestBtn = panel.querySelector('#dp-bg-test');
+    if (bgTestBtn) bgTestBtn.addEventListener('click', testBackground);
 
     const voiceCb = panel.querySelector('#dp-set-voice');
     const deletedCb = panel.querySelector('#dp-set-deleted');
@@ -1082,6 +1233,7 @@
     '.dp-empty { color: #949ba4; }',
     '.dp-note { color: #949ba4; font-size: 12px; margin-top: 8px; }',
     '#dp-log-clear, #dp-deleted-clear { background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 2px 8px; cursor: pointer; }',
+    '#dp-bg-test { background: #1e1f22; color: #dbdee1; border: 1px solid #3f4147; border-radius: 6px; padding: 4px 10px; cursor: pointer; margin-top: 6px; }',
     '.dp-live-channel { margin-bottom: 10px; }',
     '.dp-live-channel-name { font-weight: 700; margin-bottom: 4px; }',
     '.dp-live-user { padding: 4px 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }',
@@ -1137,7 +1289,7 @@
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v3.0.2');
+      log('loaded v3.0.3');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }

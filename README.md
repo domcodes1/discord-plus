@@ -2,6 +2,13 @@
 
 A Tampermonkey userscript for Discord web.
 
+## v3.0.3 fixes (Nov 19, 2026, local only, not yet pushed)
+
+- **Voice log duplicates, smoking gun fixed:** `findChannelName()` used the aria-label and only stripped a trailing "(voice channel)", but the live label is "📌 compy wompy (voice channel), unread, cute fat boy, XX, Command, and 3 others, Private Channel (locked)" - "(voice channel)" is in the middle, so the key contained the occupant list and unread state, which change on every join/leave. Now the clean channel name element inside the channel link is preferred, the aria-label fallback cuts at " (voice channel)" and ", unread", and the log key uses the channel id when available, else the clean name.
+- **Store discovery, req.m search:** `findStore()` searched only req.c (102 loaded modules). It now also searches req.m module factories: if a factory's source mentions the wanted method names, it is instantiated with req(id) and its exports checked. Diagnostics now show mSize (factory count) and mFound (a getVoiceStatesForChannel factory was found).
+- **Live DOM streaming:** LIVE is a separate red pill on the voiceUser row, not part of the button name, and streaming was never detected in DOM mode. Now `streamFromDOM()` checks row text for "LIVE" and for a [class*="live"] element, and the DOM branch of `scanLive()` (and the store path) uses it. Speaking check kept, plus a green avatar style / "Speaking" text check alongside the existing class check.
+- **Background image, in-script test:** added a "Test background" button in the Look tab (no DevTools needed). It reports whether appMount was found and its class, getComputedStyle backgroundImage/backgroundColor for appMount and body, and whether the saved image URL loads (Image onload with naturalWidth x naturalHeight, onerror, or 5s timeout), in the dp-bg-diag field. Also, when a bgUrl is set, Discord's CSS variables --background-primary/secondary/tertiary/floating/mobile-primary/mobile-secondary are now overridden to transparent, plus [class*="chat_"] [class*="container_"] background-color transparent. Existing background rules kept. No GM_xmlhttpRequest grant added, plain Image() test only.
+
 ## v3.0.2 fixes (Nov 19, 2026, local only, not yet pushed)
 
 - **Store discovery fixed:** `findStore` now accepts function exports as well as objects, tries multiple webpack chunk names (and Symbol keys), and injects a page-context `<script>` that stores the webpack require on `window.__dpWpRequire`, retried every 10s until stores are found. Diagnostics now also show chunk / wp / cache size.
