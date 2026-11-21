@@ -1,17 +1,19 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      3.0.3
+// @version      3.0.4
 // @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
 // @match        https://*.discord.com/*
 // @match        https://discordapp.com/*
 // @grant        GM_addStyle
+// @grant        GM_xmlhttpRequest
 // @grant        GM_getValue
 // @grant        GM_setValue
 // @grant        GM_registerMenuCommand
 // @grant        unsafeWindow
+// @connect      *
 // @updateURL    https://raw.githubusercontent.com/domcodes1/discord-plus/main/discord-plus.user.js
 // @downloadURL  https://raw.githubusercontent.com/domcodes1/discord-plus/main/discord-plus.user.js
 // @run-at       document-idle
@@ -139,9 +141,47 @@
     if (anyOf) return props.some((p) => typeof cand[p] === 'function');
     return props.every((p) => typeof cand[p] === 'function');
   }
+  // v3.0.4 store probe: small summary of what the req.m voice factory
+  // search actually found, shown in the Diagnostics line. Only summary
+  // fields are stored, never full source or large objects.
+  let storeProbe = { factoryId: null, reqResultType: '', reqResultKeys: [], nestedMatch: false, threw: false, found: false };
+  function isVoiceProps(props) {
+    return props && props.indexOf('getVoiceStatesForChannel') !== -1;
+  }
+  // v3.0.4: expanded candidate list for a module export. Existing
+  // candidates first, so working paths are unchanged, then deeper ones:
+  // exp.default.Z, exp.Z.default, exp.prototype, and one level of nested
+  // object/function values of exp, exp.default and exp.Z (max 25 keys
+  // each, try/catch guarded, no recursion beyond one level).
+  function expandedCandidates(exp) {
+    const out = [];
+    const push = (c) => { if (c && out.indexOf(c) === -1) out.push(c); };
+    push(exp);
+    if (exp) {
+      push(exp.default);
+      push(exp.Z);
+      try { if (exp.default) push(exp.default.Z); } catch (e) { /* ignore */ }
+      try { if (exp.Z) push(exp.Z.default); } catch (e) { /* ignore */ }
+      try { if (typeof exp === 'function' && exp.prototype) push(exp.prototype); } catch (e) { /* ignore */ }
+      const bases = [exp, exp.default, exp.Z];
+      for (const base of bases) {
+        if (!base || (typeof base !== 'object' && typeof base !== 'function')) continue;
+        try {
+          const keys = Object.keys(base).slice(0, 25);
+          for (const k of keys) {
+            let v;
+            try { v = base[k]; } catch (e) { continue; }
+            if (v && (typeof v === 'object' || typeof v === 'function')) push(v);
+          }
+        } catch (e) { /* ignore */ }
+      }
+    }
+    return out;
+  }
   function findStore(props, anyOf) {
     const req = getWpRequire();
     if (!req) return null;
+    const voice = isVoiceProps(props);
     // First: the loaded module cache, req.c (existing path).
     if (req.c) {
       const cache = req.c;
@@ -149,9 +189,11 @@
         const mod = cache[id];
         if (!mod || !mod.exports) continue;
         const exp = mod.exports;
-        const candidates = [exp, exp && exp.default, exp && exp.Z];
-        for (const cand of candidates) {
-          if (storeMatches(cand, props, anyOf)) return cand;
+        for (const cand of expandedCandidates(exp)) {
+          if (storeMatches(cand, props, anyOf)) {
+            if (voice) { storeProbe.found = true; }
+            return cand;
+          }
         }
       }
     }
@@ -170,14 +212,33 @@
         try { src = Function.prototype.toString.call(factory); } catch (e) { continue; }
         const wants = anyOf ? props.some((p) => src.indexOf(p) !== -1) : props.every((p) => src.indexOf(p) !== -1);
         if (!wants) continue;
-        if (props.indexOf('getVoiceStatesForChannel') !== -1) mFoundVoiceFactory = true;
+        if (voice) mFoundVoiceFactory = true;
         let mod;
-        try { mod = req(id); } catch (e) { continue; }
+        try { mod = req(id); } catch (e) {
+          if (voice) { storeProbe.factoryId = id; storeProbe.threw = true; }
+          continue;
+        }
         if (!mod) continue;
         const exp = mod.exports || mod;
-        const candidates = [exp, exp && exp.default, exp && exp.Z];
+        if (voice) {
+          storeProbe.factoryId = id;
+          storeProbe.threw = false;
+          try { storeProbe.reqResultType = typeof exp; } catch (e) { storeProbe.reqResultType = ''; }
+          try { storeProbe.reqResultKeys = Object.keys(exp).slice(0, 12).map(String); } catch (e) { storeProbe.reqResultKeys = []; }
+        }
+        const candidates = expandedCandidates(exp);
         for (const cand of candidates) {
-          if (storeMatches(cand, props, anyOf)) return cand;
+          if (storeMatches(cand, props, anyOf)) {
+            if (voice) { storeProbe.found = true; storeProbe.nestedMatch = candidates.indexOf(cand) > 2; }
+            return cand;
+          }
+        }
+        if (voice) {
+          // No direct candidate matched: check whether any one-level
+          // nested value carries the wanted method (probe only).
+          try {
+            storeProbe.nestedMatch = candidates.some((c) => c && props.some((p) => typeof c[p] === 'function'));
+          } catch (e) { storeProbe.nestedMatch = false; }
         }
       }
     } catch (e) { /* ignore */ }
@@ -487,37 +548,104 @@
   /* ---------------- Live Now: who is in voice / speaking / streaming, without joining ---------------- */
   let liveCache = [];
   let liveUpdatedAt = 0;
+  // v3.0.4 cumulative Live cache: DOM scans only see voice channels that
+  // are currently rendered (scrolled into view), so a wholesale replace
+  // drops channels that simply scrolled out of view. Merge instead: a
+  // channel seen in this scan replaces its own user list, channels not
+  // seen are kept for up to 60s, then pruned.
+  let liveMerged = new Map();
 
+  // v3.0.4: the LIVE pill is a separate element on the voice row, and it
+  // may live outside the [class*="voiceUser"] element itself (a sibling,
+  // or in a wrapper around the row). Collect a wider scope for a row:
+  // the row, its siblings, and ancestors up to the channel container.
+  // Careful: an ancestor that contains several voiceUser rows also
+  // contains OTHER users' LIVE pills, so ancestor text is only trusted
+  // when the ancestor holds exactly this one voiceUser row.
+  function liveRowScope(row) {
+    const els = [row];
+    if (row.nextElementSibling) els.push(row.nextElementSibling);
+    if (row.previousElementSibling) els.push(row.previousElementSibling);
+    let el = row.parentElement;
+    while (el && el !== document.body) {
+      els.push(el);
+      const cls = typeof el.className === 'string' ? el.className : '';
+      if (cls.indexOf('containerDefault') !== -1 || cls.indexOf('voiceChannel') !== -1) break;
+      el = el.parentElement;
+    }
+    return els;
+  }
+  function scopeVoiceUserCount(el) {
+    try { return el.querySelectorAll ? el.querySelectorAll('[class*="voiceUser"]').length : 0; } catch (e) { return 0; }
+  }
+  // Trust rule for a scope element: if it wraps this row, trust it only
+  // when it holds exactly one voiceUser row (this one), so another
+  // user's LIVE pill cannot leak in. If it does not wrap this row (a
+  // sibling), trust it only when it holds no voiceUser row at all, so a
+  // neighbouring user's row is never read as this user's.
+  function scopeElementTrusted(el, row) {
+    try {
+      // An element that IS a voiceUser row is another user's row, never
+      // this user's (row itself is already skipped by callers).
+      const cls = typeof el.className === 'string' ? el.className : '';
+      if (cls.indexOf('voiceUser') !== -1) return false;
+      if (el.contains && el.contains(row)) return scopeVoiceUserCount(el) === 1;
+      return scopeVoiceUserCount(el) === 0;
+    } catch (e) { return false; }
+  }
+  function scopeHasLive(row) {
+    // Row itself (v3.0.3 check, kept).
+    if ((row.textContent && row.textContent.indexOf('LIVE') !== -1) || row.querySelector('[class*="live"], [class*="Live"], [aria-label*="LIVE"], [aria-label*="live"]')) return true;
+    const scope = liveRowScope(row);
+    for (const el of scope) {
+      if (el === row) continue;
+      if (!scopeElementTrusted(el, row)) continue;
+      try {
+        if (el.querySelector && el.querySelector('[class*="live"], [class*="Live"], [aria-label*="LIVE"], [aria-label*="live"]')) return true;
+        if (el.textContent && el.textContent.indexOf('LIVE') !== -1) return true;
+      } catch (e) { /* ignore */ }
+    }
+    return false;
+  }
+  function scopeIsSpeaking(row) {
+    if (!!row.querySelector('[class*="avatarSpeaking"], [class*="speaking"]')) return true;
+    try {
+      const avatar = row.querySelector('[class*="avatar"]');
+      const style = avatar ? (avatar.getAttribute('style') || '') : '';
+      if (style.indexOf('3ba55d') !== -1 || style.indexOf('59, 165, 93') !== -1 || style.indexOf('59,165,93') !== -1) return true;
+    } catch (e) { /* ignore */ }
+    if (row.textContent && row.textContent.indexOf('Speaking') !== -1) return true;
+    const scope = liveRowScope(row);
+    for (const el of scope) {
+      if (el === row) continue;
+      if (!scopeElementTrusted(el, row)) continue;
+      try {
+        if (el.querySelector && el.querySelector('[class*="avatarSpeaking"], [class*="speaking"]')) return true;
+        if (el.textContent && el.textContent.indexOf('Speaking') !== -1) return true;
+      } catch (e) { /* ignore */ }
+    }
+    return false;
+  }
   function speakingFromDOM() {
     const out = new Map();
     document.querySelectorAll('[class*="voiceUser"]').forEach((row) => {
       const nameEl = row.querySelector('[class*="username"]');
       const name = nameEl ? nameEl.textContent.trim() : '';
       if (!name) return;
-      let speaking = !!row.querySelector('[class*="avatarSpeaking"], [class*="speaking"]');
-      if (!speaking) {
-        // Extra checks, kept alongside the class check, not replacing it.
-        try {
-          const avatar = row.querySelector('[class*="avatar"]');
-          const style = avatar ? (avatar.getAttribute('style') || '') : '';
-          if (style.indexOf('3ba55d') !== -1 || style.indexOf('59, 165, 93') !== -1 || style.indexOf('59,165,93') !== -1) speaking = true;
-        } catch (e) { /* ignore */ }
-        if (!speaking && row.textContent && row.textContent.indexOf('Speaking') !== -1) speaking = true;
-      }
-      out.set(name, speaking);
+      out.set(name, scopeIsSpeaking(row));
     });
     return out;
   }
   function streamFromDOM() {
     // LIVE is a separate red pill on the right of the voiceUser row,
-    // not part of the button name, so check the row itself.
+    // not part of the button name, so check the row itself (v3.0.3)
+    // plus the wider scope around it (v3.0.4): siblings and wrappers.
     const out = new Map();
     document.querySelectorAll('[class*="voiceUser"]').forEach((row) => {
       const nameEl = row.querySelector('[class*="username"]');
       const name = nameEl ? nameEl.textContent.trim() : '';
       if (!name) return;
-      const streaming = (row.textContent && row.textContent.indexOf('LIVE') !== -1) || !!row.querySelector('[class*="live"], [class*="Live"]');
-      out.set(name, streaming);
+      out.set(name, scopeHasLive(row));
     });
     return out;
   }
@@ -533,7 +661,7 @@
     return out;
   }
   function scanLive() {
-    if (!get('liveNow')) { liveCache = []; return; }
+    if (!get('liveNow')) { liveCache = []; liveMerged = new Map(); return; }
     // Do NOT return early when stores fail: fall through to the DOM
     // sidebar scan below, so Live Now works in DOM mode too.
     ensureStores();
@@ -592,7 +720,24 @@
         byChannel.get(key).users.push({ user, userId: '', speaking: speakingDom.get(user) || false, streaming: streamingDom.get(user) || false, muted: false });
       });
     }
-    liveCache = Array.from(byChannel.values()).sort((a, b) => a.channel.localeCompare(b.channel));
+    // v3.0.4 cumulative merge: channels seen in this scan replace their
+    // own user list (so a channel that emptied drops its users), channels
+    // not seen are kept for up to 60s (they may just be scrolled out of
+    // view / virtualized), then pruned. Stale users in an unseen channel
+    // live at most 60s; they are not kept forever.
+    const nowMs = Date.now();
+    const seenKeys = new Set();
+    byChannel.forEach((ch, key) => {
+      const mergeKey = (ch.guild || '') + '|' + key;
+      const users = new Map();
+      ch.users.forEach((u) => users.set(u.userId || u.user, u));
+      liveMerged.set(mergeKey, { channel: ch.channel, guild: ch.guild, users, lastSeen: nowMs });
+      seenKeys.add(mergeKey);
+    });
+    liveMerged.forEach((entry, key) => {
+      if (!seenKeys.has(key) && nowMs - entry.lastSeen > 60000) liveMerged.delete(key);
+    });
+    liveCache = Array.from(liveMerged.values()).map((e) => ({ channel: e.channel, guild: e.guild, users: Array.from(e.users.values()) })).sort((a, b) => a.channel.localeCompare(b.channel));
     liveUpdatedAt = Date.now();
     renderLive();
   }
@@ -724,19 +869,25 @@
       cachedMessages: msgCache.size,
       deletedCaught: loadDeleted().length,
       liveChannels: liveCache.length,
-      trackingMode
+      trackingMode,
+      probe: storeProbe
     };
   }
   function renderDiagnostics() {
     const el = document.getElementById('dp-diag');
     if (!el) return;
     const d = dpDiagnostics();
-    el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / m ' + d.mSize + ' / mFound ' + (d.mFound ? 'yes' : 'no') + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode;
+    const p = d.probe || {};
+    const probeText = ' / probe ' + (p.factoryId || 'none') + ' ' + (p.reqResultType || '?') + ' keys:' + (p.reqResultKeys && p.reqResultKeys.length ? p.reqResultKeys.join(',') : 'none') + ' nested:' + (p.nestedMatch ? 'yes' : 'no') + (p.threw ? ' threw:yes' : '');
+    el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / m ' + d.mSize + ' / mFound ' + (d.mFound ? 'yes' : 'no') + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode + probeText;
   }
   // In-script background diagnostic (v3.0.3): DevTools cannot be opened
   // in Dominic's browser, so this button reports, inside the panel,
   // whether appMount exists, what its computed background is, and
-  // whether the saved image URL actually loads. Plain Image(), no grant.
+  // whether the saved image URL actually loads. v3.0.4 also runs the
+  // GM_xhr fetch test (status, blob size, data URL length) and tests
+  // whether an Image() with that data URL loads, since direct external
+  // loads are blocked in Discord.
   function testBackground() {
     const out = document.getElementById('dp-bg-diag');
     const bgUrl = (get('bgUrl') || '').trim();
@@ -757,30 +908,86 @@
       bodyBgColor = bs.backgroundColor;
     } catch (e) { bodyBgImg = 'error'; }
     const base = 'Background test: appMount ' + (appMount ? 'found (' + appCls + ')' : 'NOT FOUND') + ' / appMount bg ' + appBgImg + ' / ' + appBgColor + ' / body bg ' + bodyBgImg + ' / ' + bodyBgColor + ' / ';
-    if (out) out.textContent = base + 'loading image...';
+    const state = { plain: 'loading image...', xhr: 'GM_xhr: not started', dataImg: '' };
+    const render = () => {
+      if (out) out.textContent = base + state.plain + ' / ' + state.xhr + (state.dataImg ? ' / ' + state.dataImg : '') + ' / url ' + bgUrl;
+    };
+    render();
+    // Plain Image() test (v3.0.3, kept).
     let done = false;
     const img = new Image();
     const timer = setTimeout(() => {
       if (done) return;
       done = true;
-      if (out) out.textContent = base + 'image TIMEOUT after 5s (did not load, may be blocked or slow) / url ' + bgUrl;
+      state.plain = 'image TIMEOUT after 5s (did not load, may be blocked or slow)';
+      render();
     }, 5000);
     img.onload = () => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (out) out.textContent = base + 'image LOADED ' + img.naturalWidth + 'x' + img.naturalHeight + ' / url ' + bgUrl;
+      state.plain = 'image LOADED ' + img.naturalWidth + 'x' + img.naturalHeight;
+      render();
     };
     img.onerror = () => {
       if (done) return;
       done = true;
       clearTimeout(timer);
-      if (out) out.textContent = base + 'image FAILED to load (onerror) / url ' + bgUrl;
+      state.plain = 'image FAILED to load (onerror)';
+      render();
     };
     try { img.src = bgUrl; } catch (e) {
       clearTimeout(timer);
-      if (out) out.textContent = base + 'image error starting load / url ' + bgUrl;
+      done = true;
+      state.plain = 'image error starting load';
+      render();
     }
+    // GM_xhr fetch test (v3.0.4), then test Image() with the data URL.
+    if (typeof GM_xmlhttpRequest !== 'function') {
+      state.xhr = 'GM_xhr: unavailable (no grant)';
+      render();
+      return;
+    }
+    state.xhr = 'GM_xhr: fetching...';
+    render();
+    loadBackgroundAsDataUrl(bgUrl, (err, dataUrl, blobSize, status) => {
+      if (err || !dataUrl) {
+        state.xhr = 'GM_xhr: FAILED ' + err;
+        render();
+        return;
+      }
+      state.xhr = 'GM_xhr: OK status ' + status + ', blob ' + (blobSize || 0) + ' bytes, data URL ' + dataUrl.length + ' chars' + (dataUrl.length >= BG_DATA_MAX ? ' (over 2 MB store limit, session-only)' : ' (cached)');
+      state.dataImg = 'data-URL image: loading...';
+      render();
+      let dDone = false;
+      const dImg = new Image();
+      const dTimer = setTimeout(() => {
+        if (dDone) return;
+        dDone = true;
+        state.dataImg = 'data-URL image: TIMEOUT after 5s';
+        render();
+      }, 5000);
+      dImg.onload = () => {
+        if (dDone) return;
+        dDone = true;
+        clearTimeout(dTimer);
+        state.dataImg = 'data-URL image: LOADED ' + dImg.naturalWidth + 'x' + dImg.naturalHeight;
+        render();
+      };
+      dImg.onerror = () => {
+        if (dDone) return;
+        dDone = true;
+        clearTimeout(dTimer);
+        state.dataImg = 'data-URL image: FAILED to load (onerror)';
+        render();
+      };
+      try { dImg.src = dataUrl; } catch (e) {
+        clearTimeout(dTimer);
+        dDone = true;
+        state.dataImg = 'data-URL image: error starting load';
+        render();
+      }
+    });
   }
   function onMessageDelete(channelId, messageId) {
     if (!get('deletedLog')) return;
@@ -882,6 +1089,95 @@
   /* ---------------- theme engine (cleaner, subtler by default) ---------------- */
   let themeStyleEl = null;
 
+  // v3.0.4 background via GM_xmlhttpRequest: v3.0.3 proved the CSS is
+  // correct (appMount bg is set to the URL, transparent) but a plain
+  // Image() / CSS url() load of an external image FAILS in Discord
+  // (onerror for both the tiger URL and picsum). GM_xmlhttpRequest runs
+  // outside the page CSP, so fetch the image as a blob, turn it into a
+  // data URL, and use that as the background instead.
+  const BG_DATA_KEY = 'dp_bg_dataurl_v1';
+  const BG_DATA_SRC_KEY = 'dp_bg_dataurl_src_v1';
+  const BG_DATA_MAX = 2000000; // do not store data URLs over ~2 MB
+  let bgFetchInFlight = null; // URL currently being fetched, or null
+  let bgFetched = {}; // URLs already fetched this session (success or fail), so a re-apply after a fetch never refetches the same URL
+  let bgSessionDataUrl = null; // data URL for this session only (used when over the 2 MB store limit)
+  let bgSessionDataSrc = '';
+
+  function getBackgroundDataUrl() {
+    try {
+      const bgUrl = (get('bgUrl') || '').trim();
+      if (!bgUrl) return null;
+      if (bgSessionDataUrl && bgSessionDataSrc === bgUrl) return bgSessionDataUrl;
+      const src = GM_getValue(BG_DATA_SRC_KEY, '');
+      if (!src || src !== bgUrl) return null;
+      const data = GM_getValue(BG_DATA_KEY, '');
+      return data && data.indexOf('data:') === 0 ? data : null;
+    } catch (e) { return null; }
+  }
+  function loadBackgroundAsDataUrl(bgUrl, cb) {
+    if (typeof GM_xmlhttpRequest !== 'function') { cb('GM_xmlhttpRequest unavailable (no grant)'); return; }
+    try {
+      GM_xmlhttpRequest({
+        method: 'GET',
+        url: bgUrl,
+        responseType: 'blob',
+        timeout: 15000,
+        onload: (resp) => {
+          try {
+            const blob = resp && resp.response;
+            const status = resp && resp.status;
+            if (!blob) { cb('GM_xhr: no blob in response (status ' + status + ')'); return; }
+            const reader = new FileReader();
+            reader.onload = () => {
+              try {
+                const dataUrl = String(reader.result || '');
+                if (dataUrl.indexOf('data:') !== 0) { cb('GM_xhr: FileReader did not return a data URL'); return; }
+                cb(null, dataUrl, blob.size || 0, status);
+              } catch (e) { cb('GM_xhr: FileReader result error ' + (e && e.message)); }
+            };
+            reader.onerror = () => cb('GM_xhr: FileReader error');
+            reader.readAsDataURL(blob);
+          } catch (e) { cb('GM_xhr: onload error ' + (e && e.message)); }
+        },
+        onerror: (resp) => cb('GM_xhr: request error (status ' + (resp && resp.status) + ')'),
+        ontimeout: () => cb('GM_xhr: request timed out after 15s')
+      });
+    } catch (e) { cb('GM_xhr: could not start request ' + (e && e.message)); }
+  }
+  // Kick off a background fetch when a bgUrl is set but no matching
+  // cached data URL exists yet. Non-blocking: the theme applies at once
+  // with the raw URL as fallback, then re-applies with the data URL
+  // when the fetch succeeds.
+  function maybeFetchBackground() {
+    const bgUrl = (get('bgUrl') || '').trim();
+    if (!bgUrl) return;
+    if (getBackgroundDataUrl()) return; // already cached for this URL
+    if (bgFetchInFlight === bgUrl) return; // already fetching this URL
+    if (bgFetched[bgUrl]) return; // already fetched this session (e.g. too large to store, session-only use)
+    bgFetchInFlight = bgUrl;
+    loadBackgroundAsDataUrl(bgUrl, (err, dataUrl, blobSize) => {
+      bgFetchInFlight = null;
+      bgFetched[bgUrl] = true;
+      if (err || !dataUrl) {
+        log('background GM_xhr failed:', err);
+        return;
+      }
+      // Only store under 2 MB; larger images still work for this session
+      // via the in-memory data URL.
+      bgSessionDataUrl = dataUrl;
+      bgSessionDataSrc = bgUrl;
+      try {
+        if (dataUrl.length < BG_DATA_MAX) {
+          GM_setValue(BG_DATA_KEY, dataUrl);
+          GM_setValue(BG_DATA_SRC_KEY, bgUrl);
+        }
+      } catch (e) { /* storage full, session-only use */ }
+      applyTheme();
+      const diag = document.getElementById('dp-bg-diag');
+      if (diag) diag.textContent = 'Background loaded via GM_xhr (data URL, ' + dataUrl.length + ' chars, blob ' + (blobSize || 0) + ' bytes) and applied.' + (dataUrl.length >= BG_DATA_MAX ? ' Too large to cache, session-only.' : '');
+    });
+  }
+
   function buildThemeCss() {
     const preset = get('themePreset');
     const accent = get('accent') || '#5865f2';
@@ -899,7 +1195,12 @@
       // shorthand (not just background-image) on html, body and every
       // Discord app root, and make Discord's own background layers
       // transparent so the image is not hidden behind a solid/gradient.
-      const safeUrl = bgUrl.replace(/"/g, '').replace(/'/g, '');
+      // v3.0.4: prefer the GM_xhr-fetched data URL when one is cached
+      // for this exact bgUrl (direct external loads are blocked in
+      // Discord); the raw URL stays as fallback until the fetch lands.
+      const dataUrl = getBackgroundDataUrl();
+      const effectiveUrl = dataUrl || bgUrl;
+      const safeUrl = effectiveUrl.replace(/"/g, '').replace(/'/g, '');
       const bgDecl = 'background: url("' + safeUrl + '") center / cover no-repeat fixed !important; background-size: cover !important; background-position: center center !important; background-attachment: fixed !important;';
       css.push(':root { --background-primary: transparent !important; --background-secondary: transparent !important; --background-tertiary: transparent !important; --background-floating: transparent !important; --background-mobile-primary: transparent !important; --background-mobile-secondary: transparent !important; }');
       css.push('html, body, [class*="appMount_"], [class*="app_"] { ' + bgDecl + ' }');
@@ -938,6 +1239,10 @@
   function applyTheme() {
     if (themeStyleEl) { themeStyleEl.remove(); themeStyleEl = null; }
     if (get('themeOn')) themeStyleEl = GM_addStyle(buildThemeCss());
+    // v3.0.4: fetch the background as a data URL in the background when
+    // no cached one exists for the current bgUrl. Guarded inside
+    // maybeFetchBackground so a successful fetch does not re-trigger.
+    maybeFetchBackground();
   }
 
   /* ---------------- UI: cleaner tabbed panel ---------------- */
@@ -1070,7 +1375,7 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.3</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.4</span><button id="dp-panel-close" title="Close">X</button></div>' +
       '<div class="dp-tabs">' +
       '<button data-tab="live">Live</button>' +
       '<button data-tab="log">Voice log</button>' +
@@ -1133,6 +1438,7 @@
       firstScan = true;
       missingCounts = new Map();
       liveCache = [];
+      liveMerged = new Map();
       scanVoice();
       scanLive();
       renderVoiceLog();
@@ -1193,7 +1499,7 @@
       if (!voiceCb.checked) { voiceState = new Map(); firstScan = true; missingCounts = new Map(); }
     });
     deletedCb.addEventListener('change', () => { set('deletedLog', deletedCb.checked); });
-    liveCb.addEventListener('change', () => { set('liveNow', liveCb.checked); if (!liveCb.checked) liveCache = []; scanLive(); });
+    liveCb.addEventListener('change', () => { set('liveNow', liveCb.checked); if (!liveCb.checked) { liveCache = []; liveMerged = new Map(); } scanLive(); });
     themeCb.addEventListener('change', () => { set('themeOn', themeCb.checked); applyTheme(); });
 
     refreshWatchSelect();
@@ -1289,7 +1595,7 @@
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v3.0.3');
+      log('loaded v3.0.4');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }
