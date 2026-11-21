@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Discord Plus
 // @namespace    https://github.com/domcodes1/discord-plus
-// @version      3.0.4
+// @version      3.0.5
 // @description  Discord web extras: voice join/leave log, Live Now voice/stream preview without joining, deleted-message viewer, and a cleaner tabbed panel with a subtle theme engine.
 // @author       domcodes1
 // @match        https://discord.com/*
@@ -144,7 +144,7 @@
   // v3.0.4 store probe: small summary of what the req.m voice factory
   // search actually found, shown in the Diagnostics line. Only summary
   // fields are stored, never full source or large objects.
-  let storeProbe = { factoryId: null, reqResultType: '', reqResultKeys: [], nestedMatch: false, threw: false, found: false };
+  let storeProbe = { factoryId: null, reqResultType: '', reqResultKeys: [], nestedMatch: false, threw: false, found: false, manualAttempt: 'skipped', manualThrewReason: '' };
   function isVoiceProps(props) {
     return props && props.indexOf('getVoiceStatesForChannel') !== -1;
   }
@@ -216,6 +216,38 @@
         let mod;
         try { mod = req(id); } catch (e) {
           if (voice) { storeProbe.factoryId = id; storeProbe.threw = true; }
+          // v3.0.5: req(id) throws for this factory (the v3.0.4 probe
+          // proved it), so invoke the factory manually with a fake
+          // module object and check its exports the same way. A
+          // throwing factory must never break the panel: every step
+          // below is try/catch guarded, and a failed manual attempt
+          // just moves on to the next factory.
+          try {
+            const fakeMod = { exports: {} };
+            factory(fakeMod, fakeMod.exports, req);
+            const fakeExp = fakeMod.exports;
+            if (voice) {
+              storeProbe.factoryId = id;
+              storeProbe.manualAttempt = 'ok';
+              try { storeProbe.reqResultType = typeof fakeExp; } catch (e2) { storeProbe.reqResultType = ''; }
+              try { storeProbe.reqResultKeys = Object.keys(fakeExp).slice(0, 12).map(String); } catch (e2) { storeProbe.reqResultKeys = []; }
+            }
+            const fakeCandidates = expandedCandidates(fakeExp);
+            for (const cand of fakeCandidates) {
+              if (storeMatches(cand, props, anyOf)) {
+                if (voice) { storeProbe.found = true; storeProbe.nestedMatch = fakeCandidates.indexOf(cand) > 2; }
+                return cand;
+              }
+            }
+            if (voice) {
+              try { storeProbe.nestedMatch = fakeCandidates.some((c) => c && props.some((p) => typeof c[p] === 'function')); } catch (e2) { storeProbe.nestedMatch = false; }
+            }
+          } catch (e2) {
+            if (voice) {
+              storeProbe.manualAttempt = 'threw';
+              try { storeProbe.manualThrewReason = String((e2 && e2.message) || e2).slice(0, 80); } catch (e3) { storeProbe.manualThrewReason = ''; }
+            }
+          }
           continue;
         }
         if (!mod) continue;
@@ -878,7 +910,7 @@
     if (!el) return;
     const d = dpDiagnostics();
     const p = d.probe || {};
-    const probeText = ' / probe ' + (p.factoryId || 'none') + ' ' + (p.reqResultType || '?') + ' keys:' + (p.reqResultKeys && p.reqResultKeys.length ? p.reqResultKeys.join(',') : 'none') + ' nested:' + (p.nestedMatch ? 'yes' : 'no') + (p.threw ? ' threw:yes' : '');
+    const probeText = ' / probe ' + (p.factoryId || 'none') + ' ' + (p.reqResultType || '?') + ' keys:' + (p.reqResultKeys && p.reqResultKeys.length ? p.reqResultKeys.join(',') : 'none') + ' nested:' + (p.nestedMatch ? 'yes' : 'no') + (p.threw ? ' threw:yes' : '') + (p.manualAttempt && p.manualAttempt !== 'skipped' ? ' manual:' + p.manualAttempt + (p.manualThrewReason ? ' (' + p.manualThrewReason + ')' : '') : '');
     el.textContent = 'Diag: chunk ' + (d.chunkExists ? 'yes' : 'no') + ' / wp ' + (d.wpFound ? 'yes' : 'no') + ' / cache ' + d.cacheSize + ' / m ' + d.mSize + ' / mFound ' + (d.mFound ? 'yes' : 'no') + ' / voice ' + (d.voiceStore ? 'yes' : 'no') + ' / msg ' + (d.messageStore ? 'yes' : 'no') + ' / dispatcher ' + (d.dispatcher ? 'yes' : 'no') + ' / subscribed ' + (d.dispatcherSubscribed ? 'yes' : 'no') + ' / stream ' + (d.streamStore ? 'yes' : 'no') + ' / cached msgs ' + d.cachedMessages + ' / deleted caught ' + d.deletedCaught + ' / live channels ' + d.liveChannels + ' / mode ' + d.trackingMode + probeText;
   }
   // In-script background diagnostic (v3.0.3): DevTools cannot be opened
@@ -888,6 +920,16 @@
   // GM_xhr fetch test (status, blob size, data URL length) and tests
   // whether an Image() with that data URL loads, since direct external
   // loads are blocked in Discord.
+  // v3.0.5: never print a full data URL. Show at most the first 120
+  // characters, then the total length, so a 3 MB data URL cannot blow
+  // up the panel (v3.0.4 dumped 3,227,574 chars into dp-bg-diag).
+  function shortBg(v) {
+    try {
+      v = String(v || '');
+      if (v.length <= 120) return v;
+      return v.slice(0, 120) + '... [total ' + v.length + ' chars]';
+    } catch (e) { return 'error'; }
+  }
   function testBackground() {
     const out = document.getElementById('dp-bg-diag');
     const bgUrl = (get('bgUrl') || '').trim();
@@ -907,7 +949,22 @@
       bodyBgImg = bs.backgroundImage;
       bodyBgColor = bs.backgroundColor;
     } catch (e) { bodyBgImg = 'error'; }
-    const base = 'Background test: appMount ' + (appMount ? 'found (' + appCls + ')' : 'NOT FOUND') + ' / appMount bg ' + appBgImg + ' / ' + appBgColor + ' / body bg ' + bodyBgImg + ' / ' + bodyBgColor + ' / ';
+    // v3.0.5: also report the main chat container's background and the
+    // topmost element at viewport center, so the next live test can say
+    // exactly which layer is still opaque over the background.
+    let chatBg = 'n/a', centerEl = 'n/a', centerBg = 'n/a';
+    try {
+      const chatEl = document.querySelector('[class*="chatContent_"]') || document.querySelector('[class*="chat_"]');
+      if (chatEl) chatBg = getComputedStyle(chatEl).backgroundColor;
+    } catch (e) { chatBg = 'error'; }
+    try {
+      const el = document.elementFromPoint(window.innerWidth / 2, window.innerHeight / 2);
+      if (el) {
+        centerEl = (el.tagName || '').toLowerCase() + '.' + String(el.className || '').slice(0, 60);
+        centerBg = getComputedStyle(el).backgroundColor;
+      }
+    } catch (e) { centerEl = 'error'; }
+    const base = 'Background test: appMount ' + (appMount ? 'found (' + appCls + ')' : 'NOT FOUND') + ' / appMount bg ' + shortBg(appBgImg) + ' / ' + appBgColor + ' / body bg ' + shortBg(bodyBgImg) + ' / ' + bodyBgColor + ' / chat bg ' + chatBg + ' / center ' + centerEl + ' bg ' + centerBg + ' / ';
     const state = { plain: 'loading image...', xhr: 'GM_xhr: not started', dataImg: '' };
     const render = () => {
       if (out) out.textContent = base + state.plain + ' / ' + state.xhr + (state.dataImg ? ' / ' + state.dataImg : '') + ' / url ' + bgUrl;
@@ -943,6 +1000,9 @@
       render();
     }
     // GM_xhr fetch test (v3.0.4), then test Image() with the data URL.
+    // v3.0.5: force a fresh fetch (clear the once-per-session guard) so
+    // re-testing actually re-tests, and a successful test fetch also
+    // refreshes the stored data URL and re-applies the theme.
     if (typeof GM_xmlhttpRequest !== 'function') {
       state.xhr = 'GM_xhr: unavailable (no grant)';
       render();
@@ -950,13 +1010,23 @@
     }
     state.xhr = 'GM_xhr: fetching...';
     render();
-    loadBackgroundAsDataUrl(bgUrl, (err, dataUrl, blobSize, status) => {
+    try { delete bgFetched[bgUrl]; } catch (e) { /* ignore */ }
+    loadBackgroundAsDataUrl(bgUrl, (err, dataUrl, blobSize, status, compressed) => {
       if (err || !dataUrl) {
         state.xhr = 'GM_xhr: FAILED ' + err;
         render();
         return;
       }
-      state.xhr = 'GM_xhr: OK status ' + status + ', blob ' + (blobSize || 0) + ' bytes, data URL ' + dataUrl.length + ' chars' + (dataUrl.length >= BG_DATA_MAX ? ' (over 2 MB store limit, session-only)' : ' (cached)');
+      state.xhr = 'GM_xhr: OK status ' + status + ', blob ' + (blobSize || 0) + ' bytes, data URL ' + dataUrl.length + ' chars' + (compressed ? ' (compressed JPEG 0.8, max 1920w)' : ' (raw, not compressed)') + (dataUrl.length >= BG_DATA_MAX ? ' (over 2 MB store limit, session-only)' : ' (cached)');
+      bgSessionDataUrl = dataUrl;
+      bgSessionDataSrc = bgUrl;
+      try {
+        if (dataUrl.length < BG_DATA_MAX) {
+          GM_setValue(BG_DATA_KEY, dataUrl);
+          GM_setValue(BG_DATA_SRC_KEY, bgUrl);
+        }
+      } catch (e) { /* storage full, session-only use */ }
+      applyTheme();
       state.dataImg = 'data-URL image: loading...';
       render();
       let dDone = false;
@@ -1114,6 +1184,59 @@
       return data && data.indexOf('data:') === 0 ? data : null;
     } catch (e) { return null; }
   }
+  // v3.0.5: try to shrink a fetched background image (max 1920 wide,
+  // re-encoded as JPEG quality 0.8) so the data URL fits under the
+  // 2 MB GM storage limit. Calls done(compUrl) with the shorter data
+  // URL, or done(null) to keep the raw one. Everything is try/catch
+  // guarded with a timeout; any failure falls back to the raw blob.
+  function compressDataUrl(blob, rawDataUrl, done) {
+    try {
+      if (!blob || typeof blob.type !== 'string' || blob.type.indexOf('image/') !== 0) { done(null); return; }
+      if (typeof Image === 'undefined' || typeof document === 'undefined' || typeof document.createElement !== 'function') { done(null); return; }
+      const objUrl = URL.createObjectURL(blob);
+      const img = new Image();
+      let finished = false;
+      const finish = (result) => {
+        if (finished) return;
+        finished = true;
+        try { URL.revokeObjectURL(objUrl); } catch (e) { /* ignore */ }
+        try { done(result); } catch (e) { /* ignore */ }
+      };
+      const to = setTimeout(() => finish(null), 8000);
+      img.onload = () => {
+        try {
+          clearTimeout(to);
+          const w = img.naturalWidth || 0, h = img.naturalHeight || 0;
+          if (!w || !h) { finish(null); return; }
+          const maxW = 1920;
+          const scale = w > maxW ? maxW / w : 1;
+          const cw = Math.max(1, Math.round(w * scale));
+          const ch = Math.max(1, Math.round(h * scale));
+          const canvas = document.createElement('canvas');
+          canvas.width = cw; canvas.height = ch;
+          const ctx = canvas.getContext('2d');
+          if (!ctx) { finish(null); return; }
+          ctx.drawImage(img, 0, 0, cw, ch);
+          if (typeof canvas.toBlob !== 'function') { finish(null); return; }
+          canvas.toBlob((outBlob) => {
+            if (!outBlob) { finish(null); return; }
+            const r2 = new FileReader();
+            r2.onload = () => {
+              try {
+                const compUrl = String(r2.result || '');
+                if (compUrl.indexOf('data:') === 0 && compUrl.length < rawDataUrl.length) finish(compUrl);
+                else finish(null);
+              } catch (e) { finish(null); }
+            };
+            r2.onerror = () => finish(null);
+            r2.readAsDataURL(outBlob);
+          }, 'image/jpeg', 0.8);
+        } catch (e) { finish(null); }
+      };
+      img.onerror = () => { clearTimeout(to); finish(null); };
+      img.src = objUrl;
+    } catch (e) { try { done(null); } catch (e2) { /* ignore */ } }
+  }
   function loadBackgroundAsDataUrl(bgUrl, cb) {
     if (typeof GM_xmlhttpRequest !== 'function') { cb('GM_xmlhttpRequest unavailable (no grant)'); return; }
     try {
@@ -1132,7 +1255,14 @@
               try {
                 const dataUrl = String(reader.result || '');
                 if (dataUrl.indexOf('data:') !== 0) { cb('GM_xhr: FileReader did not return a data URL'); return; }
-                cb(null, dataUrl, blob.size || 0, status);
+                // v3.0.5: try to shrink the image so it fits the 2 MB
+                // GM store limit. Falls back to the raw data URL on
+                // any failure; the 5th callback arg says whether the
+                // returned URL is the compressed one.
+                compressDataUrl(blob, dataUrl, (compUrl) => {
+                  if (compUrl) cb(null, compUrl, blob.size || 0, status, true);
+                  else cb(null, dataUrl, blob.size || 0, status, false);
+                });
               } catch (e) { cb('GM_xhr: FileReader result error ' + (e && e.message)); }
             };
             reader.onerror = () => cb('GM_xhr: FileReader error');
@@ -1202,12 +1332,23 @@
       const effectiveUrl = dataUrl || bgUrl;
       const safeUrl = effectiveUrl.replace(/"/g, '').replace(/'/g, '');
       const bgDecl = 'background: url("' + safeUrl + '") center / cover no-repeat fixed !important; background-size: cover !important; background-position: center center !important; background-attachment: fixed !important;';
-      css.push(':root { --background-primary: transparent !important; --background-secondary: transparent !important; --background-tertiary: transparent !important; --background-floating: transparent !important; --background-mobile-primary: transparent !important; --background-mobile-secondary: transparent !important; }');
+      // v3.0.5: Discord defines its theme variables on .theme-dark /
+      // .theme-light elements, which override :root, so the transparent
+      // overrides must live on the theme selectors too. Also cover
+      // Discord's newer variable names (--bg-base-*, --background-base-low*,
+      // --bg-surface-overlay).
+      css.push(':root, [class*="theme-dark"], [class*="theme-light"], [class*="theme-"] { --background-primary: transparent !important; --background-secondary: transparent !important; --background-tertiary: transparent !important; --background-floating: transparent !important; --background-mobile-primary: transparent !important; --background-mobile-secondary: transparent !important; --bg-base-primary: transparent !important; --bg-base-secondary: transparent !important; --bg-base-tertiary: transparent !important; --background-base-low: transparent !important; --background-base-lowest: transparent !important; --bg-surface-overlay: transparent !important; }');
       css.push('html, body, [class*="appMount_"], [class*="app_"] { ' + bgDecl + ' }');
       css.push('[class*="appMount_"], [class*="app_"], [class*="bg_"], [class*="background_"] { background-color: transparent !important; }');
-      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"], [class*="container_"] { background-color: transparent !important; }');
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="chatContent_"], [class*="content_"], [class*="members_"], [class*="messagesWrapper_"], [class*="container_"], [class*="base_"], [class*="layer_"] { background-color: transparent !important; }');
       css.push('[class*="chat_"] [class*="container_"], [class*="chat_"] { background-color: transparent !important; }');
-      css.push('[class*="sidebar_"], [class*="chat_"], [class*="members_"], [class*="messagesWrapper_"] { background-image: none !important; }');
+      css.push('[class*="sidebar_"], [class*="chat_"], [class*="chatContent_"], [class*="content_"], [class*="members_"], [class*="messagesWrapper_"], [class*="base_"] { background-image: none !important; }');
+      // Only the messages scroller goes transparent, never every scroller
+      // (member list / channel list keep their own scroll styling).
+      // Popouts, modals, tooltips, inputs, message hover states and the
+      // DP panel itself are left alone: only the layer wrapper's
+      // background-color is cleared, popout surfaces paint their own.
+      css.push('[class*="messagesWrapper_"] [class*="scroller_"] { background-color: transparent !important; }');
       css.push('[class*="listItem_"] [class*="icon_"], [class*="listItem_"] img { border-radius: 10px !important; }');
     } else if (preset === 'clean') {
       // Clean: solid dark, no loud gradient, no glow. Accent only for small highlights.
@@ -1230,7 +1371,7 @@
     css.push('::-webkit-scrollbar { width: 10px !important; height: 10px !important; }');
     css.push('::-webkit-scrollbar-thumb { background: ' + accent + ' !important; border-radius: 8px !important; border: 2px solid transparent !important; background-clip: content-box !important; }');
     css.push('::-webkit-scrollbar-track { background: transparent !important; }');
-    if (preset === 'midnight') {
+    if (preset === 'midnight' && !bgUrl) {
       css.push(':root { --background-primary: #0a0a10 !important; --background-secondary: #101018 !important; --background-tertiary: #15151f !important; }');
     }
     return css.join('\n');
@@ -1375,7 +1516,7 @@
     panel = document.createElement('div');
     panel.id = 'dp-panel';
     panel.innerHTML =
-      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.4</span><button id="dp-panel-close" title="Close">X</button></div>' +
+      '<div class="dp-panel-head"><strong>Discord Plus</strong><span class="dp-version">v3.0.5</span><button id="dp-panel-close" title="Close">X</button></div>' +
       '<div class="dp-tabs">' +
       '<button data-tab="live">Live</button>' +
       '<button data-tab="log">Voice log</button>' +
@@ -1595,7 +1736,7 @@
       GM_registerMenuCommand('Discord Plus: toggle voice log', () => { set('voiceLog', !get('voiceLog')); });
       GM_registerMenuCommand('Discord Plus: toggle deleted messages', () => { set('deletedLog', !get('deletedLog')); });
       GM_registerMenuCommand('Discord Plus: toggle custom look', () => { set('themeOn', !get('themeOn')); applyTheme(); });
-      log('loaded v3.0.4');
+      log('loaded v3.0.5');
     } catch (e) {
       console.error(TAG, 'boot failed', e);
     }
